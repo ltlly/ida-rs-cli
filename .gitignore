@@ -23,5 +23,17 @@ target
 # Dev
 sdk/
 
+# IDA databases (generated during analysis)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.til
+*.nam
+
+# Test samples (binary files)
+tests/samples/
+
 # Release
 dist/

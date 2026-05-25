@@ -78,6 +78,7 @@
 
 use std::path::PathBuf;
 
+pub mod cli;
 pub mod crash_guard;
 pub mod disasm;
 pub mod dsc;

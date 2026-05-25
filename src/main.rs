@@ -9,6 +9,7 @@
 
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
+use ida_mcp::cli::GlobalAnalysisArgs;
 use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
     build_pooled_session_manager, build_session_manager, build_streamable_config, HttpServerOptions,
@@ -62,6 +63,187 @@ enum Command {
     Worker(WorkerArgs),
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
+    /// Direct CLI analysis commands (no MCP server needed)
+    #[command(subcommand)]
+    Analyze(AnalyzeWrapper),
+}
+
+/// Wrapper to hold both global analysis args and the subcommand
+#[derive(Subcommand)]
+enum AnalyzeWrapper {
+    /// Show database/binary info
+    Info(GlobalAnalysisArgs),
+    /// List functions
+    Functions(AnalyzeFunctionsArgs),
+    /// Disassemble code
+    Disasm(AnalyzeDisasmArgs),
+    /// Decompile a function (requires Hex-Rays)
+    Decompile(AnalyzeDecompileArgs),
+    /// List/search strings
+    Strings(AnalyzeStringsArgs),
+    /// List segments
+    Segments(GlobalAnalysisArgs),
+    /// List imports
+    Imports(AnalyzeImportsArgs),
+    /// List exports
+    Exports(AnalyzeExportsArgs),
+    /// List entry points
+    Entrypoints(GlobalAnalysisArgs),
+    /// List global variables
+    Globals(AnalyzeGlobalsArgs),
+    /// Show cross-references
+    Xrefs(AnalyzeXrefsArgs),
+    /// Show basic blocks (CFG)
+    BasicBlocks(AnalyzeAddressArgs),
+    /// Show callers of a function
+    Callers(AnalyzeAddressArgs),
+    /// Show callees of a function
+    Callees(AnalyzeAddressArgs),
+    /// Read raw bytes
+    GetBytes(AnalyzeGetBytesArgs),
+    /// Search for byte patterns
+    FindBytes(AnalyzeFindBytesArgs),
+}
+
+#[derive(Args)]
+struct AnalyzeFunctionsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Offset for pagination
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Limit results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    /// Filter by function name substring
+    #[arg(long)]
+    filter: Option<String>,
+}
+
+#[derive(Args)]
+struct AnalyzeDisasmArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Address to disassemble (hex 0x... or decimal)
+    #[arg(long)]
+    address: Option<String>,
+    /// Function name to disassemble
+    #[arg(long)]
+    name: Option<String>,
+    /// Number of instructions
+    #[arg(long, default_value_t = 20)]
+    count: usize,
+}
+
+#[derive(Args)]
+struct AnalyzeDecompileArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Address to decompile (hex 0x... or decimal)
+    #[arg(long)]
+    address: Option<String>,
+    /// Function name to decompile
+    #[arg(long)]
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct AnalyzeStringsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Offset for pagination
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Limit results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    /// Filter/search query
+    #[arg(long)]
+    filter: Option<String>,
+}
+
+#[derive(Args)]
+struct AnalyzeImportsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Offset for pagination
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Limit results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct AnalyzeExportsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Offset for pagination
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Limit results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct AnalyzeGlobalsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Offset for pagination
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Limit results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    /// Filter by name substring
+    #[arg(long)]
+    filter: Option<String>,
+}
+
+#[derive(Args)]
+struct AnalyzeXrefsArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Target address (hex 0x... or decimal)
+    #[arg(long)]
+    address: String,
+    /// Direction: "to" (default) or "from"
+    #[arg(long, default_value = "to")]
+    direction: String,
+}
+
+#[derive(Args)]
+struct AnalyzeAddressArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Target address (hex 0x... or decimal)
+    #[arg(long)]
+    address: String,
+}
+
+#[derive(Args)]
+struct AnalyzeGetBytesArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Address (hex 0x... or decimal)
+    #[arg(long)]
+    address: String,
+    /// Number of bytes to read
+    #[arg(long, default_value_t = 64)]
+    size: usize,
+}
+
+#[derive(Args)]
+struct AnalyzeFindBytesArgs {
+    #[command(flatten)]
+    global: GlobalAnalysisArgs,
+    /// Hex byte pattern (e.g., "48 89 5C 24")
+    #[arg(long)]
+    pattern: String,
+    /// Max results
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
 }
 
 // Tool filter flags. Defined at the top level with `global = true` so they
@@ -245,6 +427,7 @@ fn main() -> anyhow::Result<()> {
         Command::ServeHttp(args) => run_server_http(args, build_filter()?, child_filter_args),
         Command::Worker(_args) => run_server_with_mode(build_filter()?, ServerMode::Worker),
         Command::Probe(args) => run_probe(args),
+        Command::Analyze(sub) => run_analyze(sub),
     }
 }
 
@@ -725,6 +908,114 @@ fn run_server_http_pooled(
 
     info!("Pooled HTTP server stopped");
     Ok(())
+}
+
+fn run_analyze(sub: AnalyzeWrapper) -> anyhow::Result<()> {
+    use ida_mcp::cli::{
+        run_analysis, AnalysisCommand, DisasmArgs, DecompileArgs, FunctionsArgs,
+        GetBytesArgs, FindBytesArgs, GlobalsArgs, PaginationArgs, StringsArgs, XrefsArgs,
+        AddressArgs,
+    };
+
+    let (global, cmd) = match sub {
+        AnalyzeWrapper::Info(g) => (g, AnalysisCommand::Info),
+        AnalyzeWrapper::Functions(a) => (
+            a.global,
+            AnalysisCommand::Functions(FunctionsArgs {
+                offset: a.offset,
+                limit: a.limit,
+                filter: a.filter,
+            }),
+        ),
+        AnalyzeWrapper::Disasm(a) => (
+            a.global,
+            AnalysisCommand::Disasm(DisasmArgs {
+                address: a.address,
+                name: a.name,
+                count: a.count,
+            }),
+        ),
+        AnalyzeWrapper::Decompile(a) => (
+            a.global,
+            AnalysisCommand::Decompile(DecompileArgs {
+                address: a.address,
+                name: a.name,
+            }),
+        ),
+        AnalyzeWrapper::Strings(a) => (
+            a.global,
+            AnalysisCommand::Strings(StringsArgs {
+                offset: a.offset,
+                limit: a.limit,
+                filter: a.filter,
+            }),
+        ),
+        AnalyzeWrapper::Segments(g) => (g, AnalysisCommand::Segments),
+        AnalyzeWrapper::Imports(a) => (
+            a.global,
+            AnalysisCommand::Imports(PaginationArgs {
+                offset: a.offset,
+                limit: a.limit,
+            }),
+        ),
+        AnalyzeWrapper::Exports(a) => (
+            a.global,
+            AnalysisCommand::Exports(PaginationArgs {
+                offset: a.offset,
+                limit: a.limit,
+            }),
+        ),
+        AnalyzeWrapper::Entrypoints(g) => (g, AnalysisCommand::Entrypoints),
+        AnalyzeWrapper::Globals(a) => (
+            a.global,
+            AnalysisCommand::Globals(GlobalsArgs {
+                offset: a.offset,
+                limit: a.limit,
+                filter: a.filter,
+            }),
+        ),
+        AnalyzeWrapper::Xrefs(a) => (
+            a.global,
+            AnalysisCommand::Xrefs(XrefsArgs {
+                address: a.address,
+                direction: a.direction,
+            }),
+        ),
+        AnalyzeWrapper::BasicBlocks(a) => (
+            a.global,
+            AnalysisCommand::BasicBlocks(AddressArgs {
+                address: a.address,
+            }),
+        ),
+        AnalyzeWrapper::Callers(a) => (
+            a.global,
+            AnalysisCommand::Callers(AddressArgs {
+                address: a.address,
+            }),
+        ),
+        AnalyzeWrapper::Callees(a) => (
+            a.global,
+            AnalysisCommand::Callees(AddressArgs {
+                address: a.address,
+            }),
+        ),
+        AnalyzeWrapper::GetBytes(a) => (
+            a.global,
+            AnalysisCommand::GetBytes(GetBytesArgs {
+                address: a.address,
+                size: a.size,
+            }),
+        ),
+        AnalyzeWrapper::FindBytes(a) => (
+            a.global,
+            AnalysisCommand::FindBytes(FindBytesArgs {
+                pattern: a.pattern,
+                limit: a.limit,
+            }),
+        ),
+    };
+
+    run_analysis(global, cmd)
 }
 
 fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
