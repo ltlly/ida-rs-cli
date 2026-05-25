@@ -2,12 +2,16 @@
 name = "ida-mcp"
 version = "9.3.23"
 edition = "2021"
-description = "Headless IDA Pro MCP Server"
+description = "Headless IDA Pro CLI Tool for reverse engineering"
 license = "MIT"
-repository = "https://github.com/blacktop/ida-mcp-rs"
-authors = ["blacktop"]
-keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
+repository = "https://github.com/ltlly/ida-rs-cli"
+authors = ["ltlly"]
+keywords = ["ida", "cli", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "ida-rs-cli"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

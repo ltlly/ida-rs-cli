@@ -80,6 +80,7 @@ use std::path::PathBuf;
 
 pub mod cli;
 pub mod crash_guard;
+pub mod daemon;
 pub mod disasm;
 pub mod dsc;
 pub mod error;
