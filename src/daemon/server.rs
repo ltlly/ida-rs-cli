@@ -253,6 +253,18 @@ fn dispatch_inner(mgr: &mut TargetManager, req: &Request) -> Result<Value, Strin
             Ok(json!({"status": "shutting_down"}))
         }
 
+        "int_convert" => {
+            let v = param_str(p, "value")?;
+            let val = parse_addr(v)?;
+            Ok(json!({
+                "decimal": val,
+                "hex": format!("{:#x}", val),
+                "octal": format!("{:#o}", val),
+                "binary": format!("{:#b}", val),
+                "signed": val as i64,
+            }))
+        }
+
         // -- Analysis ops (require resolved target) --
         _ => dispatch_analysis(mgr, req),
     }
@@ -323,25 +335,40 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
 
         "disasm" => {
             let idb = mgr.get_idb(&target_id)?;
-            let count = param_usize(p, "count", 20);
             let offset = param_usize(p, "offset", 0);
+            let count = param_usize(p, "count", 20);
+            // Fetch extra lines for offset, then slice
+            let total = count + offset;
             if let Some(name) = p.get("name").and_then(|v| v.as_str()) {
-                handlers::disasm::handle_disasm_by_name(idb, name, count, offset)
-                    .map_err(te).map(|s| json!({"disasm": s}))
+                handlers::disasm::handle_disasm_by_name(idb, name, total)
+                    .map_err(te)
+                    .map(|s| {
+                        let text = apply_line_offset(&s, offset);
+                        json!({"disasm": text})
+                    })
             } else {
                 let addr = param_addr(p, "address")?;
-                handlers::disasm::handle_disasm(idb, addr, count, offset)
-                    .map_err(te).map(|s| json!({"disasm": s}))
+                handlers::disasm::handle_disasm(idb, addr, total)
+                    .map_err(te)
+                    .map(|s| {
+                        let text = apply_line_offset(&s, offset);
+                        json!({"disasm": text})
+                    })
             }
         }
 
         "disasm_function_at" => {
             let idb = mgr.get_idb(&target_id)?;
             let addr = param_addr(p, "address")?;
-            let count = param_usize(p, "count", 200);
             let offset = param_usize(p, "offset", 0);
-            handlers::disasm::handle_disasm_function_at(idb, addr, count, offset)
-                .map_err(te).map(|s| json!({"disasm": s, "has_more": false}))
+            let count = param_usize(p, "count", 200);
+            let total = count + offset;
+            handlers::disasm::handle_disasm_function_at(idb, addr, total)
+                .map_err(te)
+                .map(|s| {
+                    let text = apply_line_offset(&s, offset);
+                    json!({"disasm": text, "has_more": false})
+                })
         }
 
         "decompile" => {
@@ -353,8 +380,12 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
             } else {
                 param_addr(p, "address")?
             };
-            handlers::disasm::handle_decompile(idb, addr, max_lines)
-                .map_err(te).map(|s| json!({"pseudocode": s}))
+            handlers::disasm::handle_decompile(idb, addr)
+                .map_err(te)
+                .map(|s| {
+                    let text = apply_max_lines(&s, max_lines);
+                    json!({"pseudocode": text})
+                })
         }
 
         "pseudocode_at" => {
@@ -723,18 +754,6 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
             handlers::database::handle_load_debug_info(idb, path, verbose).map_err(te)
         }
 
-        "int_convert" => {
-            let v = param_str(p, "value")?;
-            let val = parse_addr(v)?;
-            Ok(json!({
-                "decimal": val,
-                "hex": format!("{:#x}", val),
-                "octal": format!("{:#o}", val),
-                "binary": format!("{:#b}", val),
-                "signed": val as i64,
-            }))
-        }
-
         other => Err(format!("Unknown operation: {}", other)),
     }
 }
@@ -805,4 +824,29 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| format!("Invalid hex byte at position {}", i))
         })
         .collect()
+}
+
+/// Skip the first `offset` lines from a newline-separated string.
+fn apply_line_offset(s: &str, offset: usize) -> String {
+    if offset == 0 {
+        return s.to_string();
+    }
+    s.lines().skip(offset).collect::<Vec<_>>().join("\n")
+}
+
+/// Truncate output to `max_lines` lines (0 = no truncation).
+fn apply_max_lines(s: &str, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return s.to_string();
+    }
+    let lines: Vec<&str> = s.lines().take(max_lines).collect();
+    let total_lines = s.lines().count();
+    let mut result = lines.join("\n");
+    if lines.len() < total_lines {
+        result.push_str(&format!(
+            "\n// ... ({} lines truncated, use --max-lines 0 for full output)",
+            total_lines - lines.len()
+        ));
+    }
+    result
 }

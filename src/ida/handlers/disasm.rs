@@ -10,7 +10,6 @@ pub fn handle_disasm_by_name(
     idb: &Option<IDB>,
     name: &str,
     count: usize,
-    offset: usize,
 ) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
@@ -18,7 +17,7 @@ pub fn handle_disasm_by_name(
         if let Some(func_name) = func.name() {
             if func_name == name || func_name.contains(name) {
                 let addr = func.start_address();
-                return handle_disasm(idb, addr, count, offset);
+                return handle_disasm(idb, addr, count);
             }
         }
     }
@@ -26,22 +25,16 @@ pub fn handle_disasm_by_name(
     Err(ToolError::FunctionNameNotFound(name.to_string()))
 }
 
-pub fn handle_disasm(
-    idb: &Option<IDB>,
-    addr: u64,
-    count: usize,
-    offset: usize,
-) -> Result<String, ToolError> {
+pub fn handle_disasm(idb: &Option<IDB>, addr: u64, count: usize) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
-    let total = count + offset;
-    let mut all_lines = Vec::with_capacity(total);
+    let mut lines = Vec::with_capacity(count);
     let mut current_addr: Address = addr;
 
-    for _ in 0..total {
+    for _ in 0..count {
         // Get disassembly line
         if let Some(line) = generate_disasm_line(db, current_addr) {
-            all_lines.push(format!("{:#x}:\t{}", current_addr, line));
+            lines.push(format!("{:#x}:\t{}", current_addr, line));
         } else {
             // No more valid instructions
             break;
@@ -63,8 +56,6 @@ pub fn handle_disasm(
         }
     }
 
-    let lines: Vec<String> = all_lines.into_iter().skip(offset).collect();
-
     if lines.is_empty() {
         return Err(ToolError::AddressOutOfRange(addr));
     }
@@ -76,7 +67,6 @@ pub fn handle_disasm_function_at(
     idb: &Option<IDB>,
     addr: u64,
     count: usize,
-    offset: usize,
 ) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     let func = db
@@ -85,13 +75,12 @@ pub fn handle_disasm_function_at(
     let start = func.start_address();
     let end = func.end_address();
 
-    let total = count + offset;
-    let mut all_lines = Vec::new();
+    let mut lines = Vec::new();
     let mut current_addr: Address = start;
 
-    while current_addr < end && all_lines.len() < total {
+    while current_addr < end && lines.len() < count {
         if let Some(line) = generate_disasm_line(db, current_addr) {
-            all_lines.push(format!("{:#x}:\t{}", current_addr, line));
+            lines.push(format!("{:#x}:\t{}", current_addr, line));
         } else {
             break;
         }
@@ -108,8 +97,6 @@ pub fn handle_disasm_function_at(
         }
     }
 
-    let lines: Vec<String> = all_lines.into_iter().skip(offset).collect();
-
     if lines.is_empty() {
         return Err(ToolError::AddressOutOfRange(addr));
     }
@@ -117,11 +104,7 @@ pub fn handle_disasm_function_at(
     Ok(lines.join("\n"))
 }
 
-pub fn handle_decompile(
-    idb: &Option<IDB>,
-    addr: u64,
-    max_lines: usize,
-) -> Result<String, ToolError> {
+pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     if !db.decompiler_available() {
@@ -136,22 +119,7 @@ pub fn handle_decompile(
         .decompile(&func)
         .map_err(|e| ToolError::IdaError(e.to_string()))?;
 
-    let pseudocode = cfunc.pseudocode();
-
-    if max_lines > 0 {
-        let lines: Vec<&str> = pseudocode.lines().take(max_lines).collect();
-        let truncated = lines.len() < pseudocode.lines().count();
-        let mut result = lines.join("\n");
-        if truncated {
-            result.push_str(&format!(
-                "\n// ... ({} lines truncated, use --max-lines 0 for full output)",
-                pseudocode.lines().count() - lines.len()
-            ));
-        }
-        Ok(result)
-    } else {
-        Ok(pseudocode)
-    }
+    Ok(cfunc.pseudocode())
 }
 
 /// Get decompiled pseudocode statements at a specific address or address range.
