@@ -1,0 +1,4 @@
+interface:
+  display_name: "ida-rs-cli"
+  short_description: "Use ida-rs-cli for headless IDA Pro reversing tasks"
+  default_prompt: "Use $ida-rs-cli to do IDA Pro reverse engineering work through the local ida-rs-cli daemon CLI."

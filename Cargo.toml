@@ -10,6 +10,10 @@ keywords = ["ida", "cli", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
+name = "ida-mcp"
+path = "src/bin/mcp_main.rs"
+
+[[bin]]
 name = "ida-rs-cli"
 path = "src/main.rs"
 

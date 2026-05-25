@@ -335,7 +335,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::DisasmByName { name, count, resp } => {
                 debug!(name = %name, count, "Disassembling by name");
                 let result = crate::crash_guard::crash_guarded("handle_disasm_by_name", || {
-                    disasm::handle_disasm_by_name(&idb, &name, count)
+                    disasm::handle_disasm_by_name(&idb, &name, count, 0)
                 });
                 match &result {
                     Ok(text) => {
@@ -348,7 +348,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::Disasm { addr, count, resp } => {
                 debug!(address = format!("{:#x}", addr), count, "Disassembling");
                 let result = crate::crash_guard::crash_guarded("handle_disasm", || {
-                    disasm::handle_disasm(&idb, addr, count)
+                    disasm::handle_disasm(&idb, addr, count, 0)
                 });
                 match &result {
                     Ok(text) => debug!(lines = text.lines().count(), "Disassembly complete"),
@@ -361,7 +361,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::Decompile { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Decompiling");
                 let result = crate::crash_guard::crash_guarded("handle_decompile", || {
-                    disasm::handle_decompile(&idb, addr)
+                    disasm::handle_decompile(&idb, addr, 0)
                 });
                 match &result {
                     Ok(code) => debug!(lines = code.lines().count(), "Decompilation complete"),
@@ -530,7 +530,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 );
                 let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
                 let result =
-                    resolved.and_then(|ea| disasm::handle_disasm_function_at(&idb, ea, count));
+                    resolved.and_then(|ea| disasm::handle_disasm_function_at(&idb, ea, count, 0));
                 log_result!(
                     result,
                     "Disassembled function",

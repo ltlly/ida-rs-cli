@@ -324,12 +324,13 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
         "disasm" => {
             let idb = mgr.get_idb(&target_id)?;
             let count = param_usize(p, "count", 20);
+            let offset = param_usize(p, "offset", 0);
             if let Some(name) = p.get("name").and_then(|v| v.as_str()) {
-                handlers::disasm::handle_disasm_by_name(idb, name, count)
+                handlers::disasm::handle_disasm_by_name(idb, name, count, offset)
                     .map_err(te).map(|s| json!({"disasm": s}))
             } else {
                 let addr = param_addr(p, "address")?;
-                handlers::disasm::handle_disasm(idb, addr, count)
+                handlers::disasm::handle_disasm(idb, addr, count, offset)
                     .map_err(te).map(|s| json!({"disasm": s}))
             }
         }
@@ -337,20 +338,22 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
         "disasm_function_at" => {
             let idb = mgr.get_idb(&target_id)?;
             let addr = param_addr(p, "address")?;
-            let count = param_usize(p, "count", 500);
-            handlers::disasm::handle_disasm_function_at(idb, addr, count)
-                .map_err(te).map(|s| json!({"disasm": s}))
+            let count = param_usize(p, "count", 200);
+            let offset = param_usize(p, "offset", 0);
+            handlers::disasm::handle_disasm_function_at(idb, addr, count, offset)
+                .map_err(te).map(|s| json!({"disasm": s, "has_more": false}))
         }
 
         "decompile" => {
             let idb = mgr.get_idb(&target_id)?;
+            let max_lines = param_usize(p, "max_lines", 0);
             let addr = if let Some(name) = p.get("name").and_then(|v| v.as_str()) {
                 let func = handlers::functions::handle_resolve_function(idb, name).map_err(te)?;
                 parse_addr(&func.address)?
             } else {
                 param_addr(p, "address")?
             };
-            handlers::disasm::handle_decompile(idb, addr)
+            handlers::disasm::handle_decompile(idb, addr, max_lines)
                 .map_err(te).map(|s| json!({"pseudocode": s}))
         }
 

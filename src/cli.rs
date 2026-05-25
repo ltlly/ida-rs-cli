@@ -263,8 +263,8 @@ pub struct FunctionsArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Filter functions by name substring
     #[arg(long)]
@@ -287,7 +287,7 @@ pub struct LookupFuncsArgs {
 
 #[derive(Args)]
 pub struct DisasmArgs {
-    /// Address to disassemble (hex 0x... or decimal)
+    /// Address to disassemble (hex 0x... or decimal, e.g. 0x100001234)
     #[arg(long)]
     pub address: Option<String>,
     /// Function name to disassemble
@@ -296,26 +296,35 @@ pub struct DisasmArgs {
     /// Number of instructions to disassemble
     #[arg(long, default_value_t = 20)]
     pub count: usize,
+    /// Number of instructions to skip (for pagination)
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
 }
 
 #[derive(Args)]
 pub struct DisasmFunctionAtArgs {
-    /// Address within the function (hex 0x... or decimal)
+    /// Address within the function (hex 0x... or decimal, e.g. 0x100001234)
     #[arg(long)]
     pub address: String,
-    /// Maximum number of instructions
-    #[arg(long, default_value_t = 500)]
+    /// Maximum number of instructions to return
+    #[arg(long, default_value_t = 200)]
     pub count: usize,
+    /// Number of instructions to skip (for pagination through large functions)
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
 }
 
 #[derive(Args)]
 pub struct DecompileArgs {
-    /// Function address to decompile (hex 0x... or decimal)
+    /// Function address to decompile (hex 0x... or decimal, e.g. 0x100001234)
     #[arg(long)]
     pub address: Option<String>,
     /// Function name to decompile
     #[arg(long)]
     pub name: Option<String>,
+    /// Maximum number of pseudocode lines to return (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
+    pub max_lines: usize,
 }
 
 #[derive(Args)]
@@ -333,8 +342,8 @@ pub struct StringsArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Filter strings by content substring
     #[arg(long)]
@@ -355,8 +364,8 @@ pub struct FindStringArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
 }
 
@@ -378,8 +387,8 @@ pub struct AnalyzeStringsArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
 }
 
@@ -397,8 +406,8 @@ pub struct XrefsToStringArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Maximum cross-references per string
     #[arg(long, default_value_t = 10)]
@@ -410,8 +419,8 @@ pub struct PaginationArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
 }
 
@@ -420,8 +429,8 @@ pub struct GlobalsArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Filter globals by name substring
     #[arg(long)]
@@ -451,14 +460,14 @@ pub struct MultiAddressArgs {
 
 #[derive(Args)]
 pub struct CallgraphArgs {
-    /// Root function address (hex 0x... or decimal)
+    /// Root function address (hex 0x... or decimal, e.g. 0x100001234)
     #[arg(long)]
     pub address: String,
     /// Maximum call depth to traverse
     #[arg(long, default_value_t = 3)]
     pub max_depth: usize,
-    /// Maximum number of nodes in the graph
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of nodes in the graph (keep small to avoid truncation)
+    #[arg(long, default_value_t = 50)]
     pub max_nodes: usize,
 }
 
@@ -504,7 +513,7 @@ pub struct FindBytesArgs {
     #[arg(long)]
     pub pattern: String,
     /// Maximum number of results
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
 }
 
@@ -514,7 +523,7 @@ pub struct SearchTextArgs {
     #[arg(long)]
     pub text: String,
     /// Maximum number of results
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     pub max_results: usize,
 }
 
@@ -524,7 +533,7 @@ pub struct SearchImmArgs {
     #[arg(long)]
     pub value: String,
     /// Maximum number of results
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     pub max_results: usize,
 }
 
@@ -534,7 +543,7 @@ pub struct FindInsnsArgs {
     #[arg(long, value_delimiter = ',')]
     pub patterns: Vec<String>,
     /// Maximum number of results
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     pub max_results: usize,
     /// Case insensitive pattern matching
     #[arg(long)]
@@ -546,8 +555,8 @@ pub struct LocalTypesArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Filter types by name substring
     #[arg(long)]
@@ -660,8 +669,8 @@ pub struct StructsArgs {
     /// Number of items to skip
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Maximum number of items to return
-    #[arg(long, default_value_t = 100)]
+    /// Maximum number of items to return (use --offset to paginate)
+    #[arg(long, default_value_t = 50)]
     pub limit: usize,
     /// Filter structs by name substring
     #[arg(long)]
@@ -1049,13 +1058,13 @@ fn cli_command_to_request(cmd: &CliCommand) -> anyhow::Result<(String, serde_jso
         CliCommand::AnalyzeFuncs => ("analyze_funcs", json!({})),
 
         CliCommand::Disasm(a) => ("disasm", json!({
-            "address": a.address, "name": a.name, "count": a.count,
+            "address": a.address, "name": a.name, "count": a.count, "offset": a.offset,
         })),
         CliCommand::DisasmFunctionAt(a) => ("disasm_function_at", json!({
-            "address": a.address, "count": a.count,
+            "address": a.address, "count": a.count, "offset": a.offset,
         })),
         CliCommand::Decompile(a) => ("decompile", json!({
-            "address": a.address, "name": a.name,
+            "address": a.address, "name": a.name, "max_lines": a.max_lines,
         })),
         CliCommand::PseudocodeAt(a) => ("pseudocode_at", json!({
             "address": a.address, "end_address": a.end_address,

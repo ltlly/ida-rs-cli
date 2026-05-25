@@ -1,7 +1,7 @@
 <p align="center">
   <!--<a href="https://github.com/blacktop/ida-mcp-rs"><img alt="Logo" src="https://raw.githubusercontent.com/blacktop/ida-mcp-rs/refs/heads/main/docs/logo.svg" height="400"/></a>-->
   <h1 align="center">ida-mcp-rs</h1>
-  <h4><p align="center">Headless IDA Pro MCP server for AI-powered reverse engineering.</p></h4>
+  <h4><p align="center">Headless IDA Pro MCP server & CLI for AI-powered reverse engineering.</p></h4>
   <p align="center">
     <a href="https://github.com/blacktop/ida-mcp-rs/actions" alt="Actions">
           <img src="https://github.com/blacktop/ida-mcp-rs/actions/workflows/build.yml/badge.svg" /></a>
@@ -13,6 +13,15 @@
           <img src="https://img.shields.io/:license-mit-blue.svg" /></a>
 </p>
 <br>
+
+> **[中文文档](README.zh.md)**
+
+This project builds **two binaries** from a shared codebase:
+
+| Binary | Purpose | Transport |
+|--------|---------|-----------|
+| `ida-mcp` | MCP server for AI agents (Claude, Codex, Cursor, etc.) | stdio / Streamable HTTP |
+| `ida-rs-cli` | Daemon-based CLI for direct terminal use and agent skills | Unix socket IPC |
 
 ## Prerequisites
 
@@ -53,7 +62,11 @@ sudo snap connect ida-mcp:dot-idapro   # grant access to ~/.idapro (license)
 
 **Build from source**
 
-See [docs/BUILDING.md](docs/BUILDING.md).
+```bash
+cargo build --release    # builds both ida-mcp and ida-rs-cli
+```
+
+See [docs/BUILDING.md](docs/BUILDING.md) for details.
 
 > ida-mcp versions mirror IDA Pro versions (`v9.3.x` for IDA 9.3, `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop and NUR publish the latest version. For older IDA versions, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or the versioned Homebrew cask.
 
@@ -132,6 +145,10 @@ The binary links against IDA's libraries at runtime. Standard installation paths
 | Linux | `libida.so` | `IDADIR` (launcher reads it) or `LD_LIBRARY_PATH` |
 | Windows | `ida.dll` | Place exe in IDA dir, set `IDADIR`, or add IDA dir to `PATH` |
 
+---
+
+## MCP Server (`ida-mcp`)
+
 ### Configure your AI agent
 
 #### [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
@@ -159,7 +176,7 @@ Add to `.cursor/mcp.json`:
 }
 ```
 
-### Usage
+### MCP Usage
 
 Once configured, you can analyze binaries through your AI agent:
 
@@ -262,9 +279,7 @@ run_script(code: "import ida_bytes; print(ida_bytes.get_bytes(0x1000, 16).hex())
 
 All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API reference](https://python.docs.hex-rays.com).
 
----
-
-## Context Optimization
+### Context Optimization
 
 `ida-mcp` exposes 71 tools (~10k tokens of `tools/list` payload). Frontier models with 1M context don't notice; smaller models and agents without lazy tool loading do. Filter the surface to only what you need:
 
@@ -277,7 +292,7 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 
 No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
 
-### Recommendations by client
+#### Recommendations by client
 
 - **Claude Code, Cursor:** no action — both clients already lazy-load MCP tool schemas. Claude Code's MCP Tool Search auto-defers when tools exceed 10% of context (Cursor's Dynamic Context Discovery does similar).
 - **Codex CLI, OpenCode:** every session pays the full ~10k tokens. Pick a focused subset:
@@ -293,7 +308,7 @@ No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly
   ida-mcp --toolsets=core,functions --tools=decompile,callees,callers --read-only
   ```
 
-### Configuring through `mcpServers.json`
+#### Configuring through `mcpServers.json`
 
 Most installed MCP configs run `ida-mcp` directly without a subcommand. The env vars apply on that path too:
 
@@ -311,9 +326,126 @@ Most installed MCP configs run `ida-mcp` directly without a subcommand. The env 
 }
 ```
 
-### Measuring
+#### Measuring
 
 Run `just measure-tools` to see the per-tool char/token breakdown. Filtering doesn't change the numbers reported there (it acts at the protocol boundary), but the difference shows up in your client's context view (`/context` in Claude Code, equivalents elsewhere).
+
+---
+
+## CLI Tool (`ida-rs-cli`)
+
+`ida-rs-cli` provides a daemon-based CLI for direct terminal interaction and agent skill integration. It shares the same analysis engine as `ida-mcp` but exposes it as Unix commands rather than MCP tools.
+
+### Quick Start
+
+```bash
+# Start the daemon (holds binaries in memory)
+ida-rs-cli daemon start
+
+# Load a binary
+ida-rs-cli target load -f /path/to/binary.so
+
+# Analyze
+ida-rs-cli functions --limit 20
+ida-rs-cli decompile --name main
+ida-rs-cli xrefs-to --address 0x100001234
+ida-rs-cli strings --filter "password"
+```
+
+### Architecture
+
+```
+┌─────────────────┐       Unix Socket        ┌─────────────────────┐
+│   ida-rs-cli    │ ──── JSON-line IPC ────▶ │      Daemon          │
+│  (stateless)    │ ◀──── JSON response ──── │  (persistent, holds  │
+└─────────────────┘                           │   IDBs in memory)    │
+                                              └─────────────────────┘
+```
+
+The daemon runs on the main thread (required by IDA's library), manages multiple loaded targets via `TargetManager`, and processes requests sequentially. The CLI connects, sends one request, reads one response, then exits.
+
+### Daemon Management
+
+```bash
+ida-rs-cli daemon start          # start (foreground)
+ida-rs-cli daemon start --background   # (planned)
+ida-rs-cli daemon stop           # graceful shutdown
+ida-rs-cli daemon status         # health check + loaded target count
+```
+
+### Target Management
+
+```bash
+ida-rs-cli target load -f app.so                # load binary
+ida-rs-cli target load -f app.i64               # open existing IDB
+ida-rs-cli target load -f app.so --no-analyse   # skip auto-analysis
+ida-rs-cli target list                          # show all loaded targets
+ida-rs-cli target switch --id t2                # change active target
+ida-rs-cli target close --id t1                 # unload a target
+```
+
+### Command Categories
+
+| Category | Commands |
+|----------|----------|
+| Info | `info`, `meta`, `analysis-status` |
+| Functions | `functions`, `resolve-function`, `function-at`, `lookup-funcs`, `analyze-funcs` |
+| Disassembly | `disasm`, `disasm-function-at`, `decompile`, `pseudocode-at` |
+| Strings | `strings`, `find-string`, `get-string`, `analyze-strings`, `xrefs-to-string` |
+| Structure | `segments`, `imports`, `exports`, `entrypoints`, `globals`, `get-global-value` |
+| Xrefs | `xrefs-to`, `xrefs-from`, `xref-matrix` |
+| Control Flow | `basic-blocks`, `callers`, `callees`, `callgraph`, `find-paths` |
+| Memory | `get-bytes`, `read-int`, `find-bytes` |
+| Search | `search-text`, `search-imm`, `find-insns`, `find-insn-operands` |
+| Types | `local-types`, `declare-type`, `apply-types`, `infer-types`, `stack-frame`, `declare-stack`, `delete-stack` |
+| Structs | `structs`, `struct-info`, `read-struct`, `xrefs-to-field` |
+| Annotations | `set-comment`, `rename`, `patch-bytes`, `patch-asm` |
+| Scripting | `run-script` |
+| Utility | `int-convert`, `addr-info`, `load-debug-info` |
+
+### Pagination & Output
+
+All list commands support `--offset` and `--limit` (default 50):
+
+```bash
+ida-rs-cli functions --offset 0 --limit 50     # page 1
+ida-rs-cli functions --offset 50 --limit 50    # page 2
+ida-rs-cli imports --limit 100                 # larger page
+```
+
+Output is JSON to stdout. Pipe with `jq` for filtering:
+
+```bash
+ida-rs-cli functions | jq '.[].name'
+ida-rs-cli decompile --name main | jq -r '.pseudocode'
+```
+
+### Multi-Target Usage
+
+When multiple binaries are loaded, use `-t` to select:
+
+```bash
+ida-rs-cli -t libfoo functions            # by filename substring
+ida-rs-cli -t t2 disasm --address 0x1000  # by target ID
+```
+
+### Install Agent Skill
+
+Install the bundled skill definition into Claude Code and/or Codex CLI so the agent knows how to use `ida-rs-cli`:
+
+```bash
+./scripts/install-skill.sh                    # both clients (symlink)
+./scripts/install-skill.sh --client codex     # Codex only
+./scripts/install-skill.sh --client claude-code  # Claude Code only
+./scripts/install-skill.sh --mode copy        # copy instead of symlink
+./scripts/install-skill.sh --uninstall        # remove
+```
+
+Skill directories:
+- Claude Code: `~/.claude/skills/ida-rs-cli/`
+- Codex CLI: `~/.codex/skills/ida-rs-cli/`
+
+---
 
 ## Docs
 
