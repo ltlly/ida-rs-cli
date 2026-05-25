@@ -8,6 +8,11 @@ use ida_mcp::cli::Cli;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 fn main() -> anyhow::Result<()> {
+    // Suppress IDA library's "Thank you for using IDA" exit message.
+    // The CLI client links idalib but only the daemon actually uses it;
+    // however the dynamic library constructor registers an atexit handler.
+    let _ = idalib::enable_console_messages(false);
+
     // Initialize logging to stderr (stdout is reserved for JSON output)
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))

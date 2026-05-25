@@ -45,6 +45,8 @@ pub fn run_daemon(foreground: bool) -> anyhow::Result<()> {
     info!("Initializing IDA library...");
     idalib::init_library()
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
+    // Suppress IDA's "Thank you for using IDA" goodbye message on exit
+    let _ = idalib::enable_console_messages(false);
     info!("IDA library initialized");
 
     // Channel: socket thread -> main thread
