@@ -26,16 +26,14 @@
 ## Install / 安装
 
 ```bash
-# Build from source / 从源码构建
+git clone https://github.com/ltlly/ida-rs-cli.git
+cd ida-rs-cli
 cargo build --release --bin ida-rs-cli
-
-# Or build both binaries / 或构建两个二进制
-cargo build --release
 ```
 
-See [docs/BUILDING.md](docs/BUILDING.md) for build details.
+The built binary will be at `target/release/ida-rs-cli`. See [docs/BUILDING.md](docs/BUILDING.md) for more details.
 
-构建细节见 [docs/BUILDING.md](docs/BUILDING.md)。
+编译产物位于 `target/release/ida-rs-cli`。更多细节见 [docs/BUILDING.md](docs/BUILDING.md)。
 
 ## Quick Start / 快速开始
 
