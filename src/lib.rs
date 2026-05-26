@@ -86,6 +86,7 @@ pub mod dsc;
 pub mod error;
 pub mod ida;
 pub mod server;
+pub mod spill;
 pub mod tool_registry;
 
 pub use error::ToolError;

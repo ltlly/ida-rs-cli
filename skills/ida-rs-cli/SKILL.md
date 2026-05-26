@@ -196,7 +196,7 @@ ida-rs-cli functions --offset 0 --limit 50    # first page
 ida-rs-cli functions --offset 50 --limit 50   # second page
 ```
 
-## Output
+## Output & Auto-Spill
 
 All commands output JSON to stdout. Errors go to stderr. Use `jq` for filtering:
 
@@ -205,11 +205,42 @@ ida-rs-cli functions | jq '.[].name'
 ida-rs-cli decompile --name main | jq -r '.pseudocode'
 ```
 
+### Auto-Spill (Context Explosion Prevention)
+
+When command output exceeds a token threshold, the CLI automatically writes the full result to a temporary file and returns a compact JSON metadata envelope instead. This prevents large outputs from flooding agent context windows.
+
+```bash
+# Global option (default: 10000 tokens, env: IDA_SPILL_THRESHOLD)
+ida-rs-cli --spill-threshold 5000 functions --limit 500
+
+# Disable spill (0 = unlimited)
+ida-rs-cli --spill-threshold 0 functions --limit 5000
+```
+
+When spill triggers, the CLI outputs a metadata envelope like:
+
+```json
+{
+  "spilled": true,
+  "ok": true,
+  "artifact_path": "/tmp/ida-rs-spills/20250526/functions-143022_512.json",
+  "bytes": 48320,
+  "tokens_estimate": 12716,
+  "format": "json",
+  "sha256": "abcdef...",
+  "summary": { "kind": "object", "keys": ["functions","total","next_offset"], "count": 3 },
+  "hint": "Output exceeded token limit. Full result saved to artifact_path. Use `cat` or read the file to access complete data."
+}
+```
+
+To access the full data, read `artifact_path` directly. Spill files are stored in `$TMPDIR/ida-rs-spills/YYYYMMDD/` and can be cleaned up periodically.
+
 ## Tips
 
 - Start the daemon first; all analysis commands require it.
 - Use `-t <selector>` to target a specific binary when multiple are loaded.
-- Keep `--limit` values reasonable (≤50) to avoid huge outputs.
+- Keep `--limit` values reasonable (≤50) to avoid huge outputs; auto-spill handles overflow gracefully.
 - For large functions, paginate disassembly with `--offset`.
 - `--max-lines 0` in decompile means unlimited output.
 - `decompile` requires Hex-Rays; without it only `disasm` commands work.
+- Set `IDA_SPILL_THRESHOLD` env var to adjust spill threshold globally without passing `--spill-threshold` every time.

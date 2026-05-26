@@ -39,6 +39,7 @@ http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
 
 [build-dependencies]
 cc = "1"

@@ -33,6 +33,12 @@ pub struct Cli {
     #[arg(long, short = 't', global = true)]
     pub target: Option<String>,
 
+    /// Auto-spill token threshold. Outputs exceeding this estimated token count
+    /// are written to a temporary file instead of stdout, preventing context
+    /// explosion for AI agents. Set to 0 to disable spilling.
+    #[arg(long, global = true, default_value_t = crate::spill::DEFAULT_SPILL_TOKEN_LIMIT, env = "IDA_SPILL_THRESHOLD")]
+    pub spill_threshold: usize,
+
     #[command(subcommand)]
     pub command: CliCommand,
 }
@@ -964,7 +970,8 @@ fn run_via_daemon(cli: &Cli) -> anyhow::Result<()> {
     let response = send_daemon_request(&op, params, cli.target.as_deref())?;
     if response.ok {
         if let Some(result) = &response.result {
-            println!("{}", serde_json::to_string_pretty(result)?);
+            let spill_result = crate::spill::maybe_spill(result, &op, cli.spill_threshold)?;
+            println!("{}", spill_result.stdout_output);
         }
     } else {
         anyhow::bail!(
