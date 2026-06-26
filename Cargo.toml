@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.3.23"
+version = "9.3.24"
 edition = "2021"
 description = "Headless IDA Pro CLI Tool for reverse engineering"
 license = "MIT"
@@ -20,7 +20,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
-rmcp = { version = "1.6", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
+rmcp = { version = "1.7", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
