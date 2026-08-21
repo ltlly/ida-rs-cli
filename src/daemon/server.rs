@@ -486,13 +486,17 @@ fn dispatch_analysis(mgr: &mut TargetManager, req: &Request) -> Result<Value, St
         "xrefs_to" => {
             let idb = mgr.get_idb(&target_id)?;
             let addr = param_addr(p, "address")?;
-            handlers::xrefs::handle_xrefs_to(idb, addr).map_err(te).and_then(to_json_v)
+            let offset = param_usize(p, "offset", 0);
+            let limit = param_usize(p, "limit", 1000).clamp(1, 10000);
+            handlers::xrefs::handle_xrefs_to(idb, addr, offset, limit).map_err(te).and_then(to_json_v)
         }
 
         "xrefs_from" => {
             let idb = mgr.get_idb(&target_id)?;
             let addr = param_addr(p, "address")?;
-            handlers::xrefs::handle_xrefs_from(idb, addr).map_err(te).and_then(to_json_v)
+            let offset = param_usize(p, "offset", 0);
+            let limit = param_usize(p, "limit", 1000).clamp(1, 10000);
+            handlers::xrefs::handle_xrefs_from(idb, addr, offset, limit).map_err(te).and_then(to_json_v)
         }
 
         "xref_matrix" => {

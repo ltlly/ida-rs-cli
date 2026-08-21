@@ -112,10 +112,10 @@ pub enum CliCommand {
     GetGlobalValue(QueryArgs),
 
     // ── Cross-References ─────────────────────────────────────────────────
-    /// Show all cross-references TO an address
-    XrefsTo(AddressArgs),
-    /// Show all cross-references FROM an address
-    XrefsFrom(AddressArgs),
+    /// Show cross-references TO an address (paginated)
+    XrefsTo(XrefPageArgs),
+    /// Show cross-references FROM an address (paginated)
+    XrefsFrom(XrefPageArgs),
     /// Build an xref adjacency matrix for multiple addresses
     XrefMatrix(MultiAddressArgs),
 
@@ -455,6 +455,19 @@ pub struct AddressArgs {
     /// Target address (hex 0x... or decimal)
     #[arg(long)]
     pub address: String,
+}
+
+#[derive(Args)]
+pub struct XrefPageArgs {
+    /// Target address (hex 0x... or decimal)
+    #[arg(long)]
+    pub address: String,
+    /// Number of xrefs to skip
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    /// Maximum number of xrefs to return (max 10000)
+    #[arg(long, default_value_t = 1000)]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -1104,8 +1117,12 @@ fn cli_command_to_request(cmd: &CliCommand) -> anyhow::Result<(String, serde_jso
         })),
         CliCommand::GetGlobalValue(a) => ("get_global_value", json!({"query": a.query})),
 
-        CliCommand::XrefsTo(a) => ("xrefs_to", json!({"address": a.address})),
-        CliCommand::XrefsFrom(a) => ("xrefs_from", json!({"address": a.address})),
+        CliCommand::XrefsTo(a) => ("xrefs_to", json!({
+            "address": a.address, "offset": a.offset, "limit": a.limit,
+        })),
+        CliCommand::XrefsFrom(a) => ("xrefs_from", json!({
+            "address": a.address, "offset": a.offset, "limit": a.limit,
+        })),
         CliCommand::XrefMatrix(a) => ("xref_matrix", json!({"addresses": a.addresses})),
 
         CliCommand::BasicBlocks(a) => ("basic_blocks", json!({"address": a.address})),
