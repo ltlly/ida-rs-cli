@@ -26,6 +26,7 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "patch_asm",
     "rename",
     "set_comments",
+    "lumina_apply",
     "declare_type",
     "apply_types",
     "infer_types",
@@ -192,6 +193,17 @@ mod tests {
     }
 
     #[test]
+    fn lumina_tools_follow_read_and_write_categories() {
+        let metadata = ToolFilter::from_inputs(&cat("metadata"), &[], &[], false).unwrap();
+        assert!(metadata.is_enabled("lumina_lookup"));
+        assert!(!metadata.is_enabled("lumina_apply"));
+
+        let editing = ToolFilter::from_inputs(&cat("editing"), &[], &[], false).unwrap();
+        assert!(editing.is_enabled("lumina_apply"));
+        assert!(!editing.is_enabled("lumina_lookup"));
+    }
+
+    #[test]
     fn exclude_tools_wins_over_includes() {
         let f =
             ToolFilter::from_inputs(&cat("core"), &cat("run_script"), &cat("run_script"), false)
@@ -220,6 +232,7 @@ mod tests {
             "tool_help",
             "idb_meta",
             "load_debug_info",
+            "lumina_lookup",
         ] {
             assert!(f.is_enabled(name), "read-only must keep {name}");
         }

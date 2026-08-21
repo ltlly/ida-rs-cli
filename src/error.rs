@@ -3,13 +3,15 @@
 //! Tool execution errors are returned with `is_error: true` in CallToolResult,
 //! while protocol errors (invalid tool name, malformed args) are handled by rmcp.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock as Content};
 use thiserror::Error;
 
 /// Tool execution errors - returned with is_error: true in CallToolResult
 #[derive(Error, Debug)]
 pub enum ToolError {
-    #[error("No database is currently open. If you had one open previously, the server may have restarted — call open_idb again.")]
+    #[error(
+        "No database is currently open. If you had one open previously, the server may have restarted — call open_idb again."
+    )]
     NoDatabaseOpen,
 
     #[error("A database is already open: {0}. Use close_idb first.")]
@@ -59,6 +61,22 @@ pub enum ToolError {
 
     #[error("Server is busy (request queue full). Please retry.")]
     Busy,
+
+    #[error(
+        "The database this background operation opened was closed and replaced. \
+         Its remaining work was abandoned so it cannot touch the current database."
+    )]
+    DatabaseReplaced,
+
+    #[error(
+        "Matching background work is already running; its task handle stays with the response that started it. Retry after it finishes."
+    )]
+    BackgroundTaskHandlePrivate,
+
+    #[error(
+        "Background task registry is full ({max} retained tasks). Retry after older results expire."
+    )]
+    BackgroundTaskRegistryFull { max: usize },
 
     #[error(
         "Worker pool exhausted: {active}/{max} workers are leased. Close an IDB or retry later."

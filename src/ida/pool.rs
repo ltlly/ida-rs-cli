@@ -8,8 +8,8 @@ use crate::ida::types::*;
 use crate::ida::worker::MAX_TIMEOUT_SECS;
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolResult, ClientInfo, JsonObject, LoggingMessageNotificationParam};
-use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService};
+use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::de::DeserializeOwned;
@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -37,8 +38,20 @@ pub struct WorkerPoolConfig {
     pub worker_idle_timeout: Duration,
     pub worker_op_timeout: Duration,
     pub exe_path: PathBuf,
-    pub filter_args: Vec<OsString>,
+    /// Process-wide CLI arguments forwarded to worker processes.
+    pub worker_args: Vec<OsString>,
 }
+
+/// Public tool-filter environment variables. Filtering is enforced by the
+/// parent HTTP server; private child workers must keep lifecycle/internal
+/// tools such as `close_idb` and `analyze_funcs` available for the parent,
+/// so these are stripped from the child environment.
+const CHILD_FILTER_ENV_VARS: &[&str] = &[
+    "IDA_MCP_TOOLSETS",
+    "IDA_MCP_TOOLS",
+    "IDA_MCP_EXCLUDE_TOOLS",
+    "IDA_MCP_READ_ONLY",
+];
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -93,26 +106,9 @@ pub struct PooledWorkerHandle {
 }
 
 #[derive(Clone)]
-struct ParentClientHandler {
-    worker_id: usize,
-}
+struct ParentClientHandler;
 
 impl ClientHandler for ParentClientHandler {
-    async fn on_logging_message(
-        &self,
-        params: LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        debug!(
-            target: "ida_mcp::worker",
-            worker_id = self.worker_id,
-            level = ?params.level,
-            logger = ?params.logger,
-            data = ?params.data,
-            "child worker log"
-        );
-    }
-
     fn get_info(&self) -> ClientInfo {
         ClientInfo::default()
     }
@@ -425,15 +421,23 @@ impl WorkerPool {
         }
     }
 
+    fn worker_command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.config.exe_path);
+        cmd.args(&self.config.worker_args);
+        cmd.arg("worker");
+        for var in CHILD_FILTER_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.kill_on_drop(true);
+        cmd
+    }
+
     async fn spawn_slot(
         &self,
         id: usize,
         initial_state: ChildState,
     ) -> Result<Arc<ChildSlot>, ToolError> {
-        let mut cmd = tokio::process::Command::new(&self.config.exe_path);
-        cmd.args(&self.config.filter_args);
-        cmd.arg("worker");
-        cmd.kill_on_drop(true);
+        let cmd = self.worker_command();
 
         let (transport, stderr) = TokioChildProcess::builder(cmd)
             .stderr(Stdio::piped())
@@ -443,7 +447,7 @@ impl WorkerPool {
             })?;
         let pid = transport.id();
         let stderr_task = spawn_stderr_relay(id, stderr);
-        let handler = ParentClientHandler { worker_id: id };
+        let handler = ParentClientHandler;
         let service = handler.serve(transport).await.map_err(|err| {
             ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
         })?;
@@ -815,8 +819,15 @@ impl PooledWorkerHandle {
 pub struct PooledSessionState {
     pool: WorkerPool,
     session_id: String,
-    handle: Arc<Mutex<Option<PooledWorkerHandle>>>,
+    handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
+    next_database_generation: AtomicU64,
     runtime: Option<Handle>,
+}
+
+#[derive(Clone)]
+struct PooledDatabaseLease {
+    handle: PooledWorkerHandle,
+    generation: DatabaseGeneration,
 }
 
 impl PooledSessionState {
@@ -825,32 +836,66 @@ impl PooledSessionState {
             pool,
             session_id,
             handle: Arc::new(Mutex::new(None)),
+            next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
         }
     }
 
-    async fn lease_for_open(&self) -> Result<(PooledWorkerHandle, bool), ToolError> {
+    fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
+        let previous = self
+            .next_database_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                ToolError::IdaError("database generation counter exhausted".to_string())
+            })?;
+        previous
+            .checked_add(1)
+            .map(DatabaseGeneration)
+            .ok_or_else(|| ToolError::IdaError("database generation counter exhausted".to_string()))
+    }
+
+    async fn lease_for_open(
+        &self,
+    ) -> Result<(PooledWorkerHandle, DatabaseGeneration, bool), ToolError> {
         let mut guard = self.handle.lock().await;
-        if let Some(handle) = guard.as_ref() {
-            return Ok((handle.clone(), false));
+        if let Some(lease) = guard.as_ref() {
+            return Ok((lease.handle.clone(), lease.generation, false));
         }
+        let generation = self.next_database_generation()?;
         let handle = self.pool.lease(&self.session_id).await?;
-        *guard = Some(handle.clone());
-        Ok((handle, true))
+        *guard = Some(PooledDatabaseLease {
+            handle: handle.clone(),
+            generation,
+        });
+        Ok((handle, generation, true))
     }
 
-    async fn required_handle(&self) -> Result<PooledWorkerHandle, ToolError> {
+    /// Resolve the leased worker, optionally only while `expected_generation`
+    /// is still this session's database lifetime.
+    ///
+    /// The generation comparison and the handle clone happen under one lock
+    /// acquisition: a `close_idb` that replaces the lease either loses the race
+    /// (we dispatch against the database we opened) or wins it (we refuse). A
+    /// caller that checked separately could be redirected onto the new lease.
+    async fn required_handle_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<PooledWorkerHandle, ToolError> {
         let guard = self.handle.lock().await;
-        guard.as_ref().cloned().ok_or(ToolError::NoDatabaseOpen)
+        let lease = guard.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+        require_lease_generation(lease.generation, expected_generation)?;
+        Ok(lease.handle.clone())
     }
 
-    async fn take_handle(&self) -> Option<PooledWorkerHandle> {
+    async fn take_handle(&self) -> Option<PooledDatabaseLease> {
         self.handle.lock().await.take()
     }
 
     async fn release_current_handle(&self) {
-        if let Some(handle) = self.take_handle().await {
-            let _ = self.pool.release(handle).await;
+        if let Some(lease) = self.take_handle().await {
+            let _ = self.pool.release(lease.handle).await;
         }
     }
 
@@ -858,20 +903,25 @@ impl PooledSessionState {
         let mut guard = self.handle.lock().await;
         if guard
             .as_ref()
-            .is_some_and(|handle| handle.worker_id == worker_id)
+            .is_some_and(|lease| lease.handle.worker_id == worker_id)
         {
             *guard = None;
         }
     }
 
-    async fn call_result(
+    /// Call a child tool, optionally bound to one database lifetime (see
+    /// [`Self::required_handle_for_generation`]).
+    async fn call_result_for_generation(
         &self,
         tool: &'static str,
         args: Value,
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
     ) -> Result<CallToolResult, ToolError> {
-        let handle = self.required_handle().await?;
+        let handle = self
+            .required_handle_for_generation(expected_generation)
+            .await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         match handle
             .call_tool(tool, remote::json_object(args)?, timeout, cancel)
@@ -901,7 +951,21 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<T, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        self.call_json_for_generation(tool, args, timeout_secs, cancel, None)
+            .await
+    }
+
+    async fn call_json_for_generation<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<T, ToolError> {
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await?;
         remote::parse_json(result, tool)
     }
 
@@ -912,8 +976,54 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<Value, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        self.call_value_for_generation(tool, args, timeout_secs, cancel, None)
+            .await
+    }
+
+    async fn call_value_for_generation(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<Value, ToolError> {
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await?;
         remote::parse_value(result, tool)
+    }
+
+    async fn call_json_field<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        field: &'static str,
+        timeout_secs: Option<u64>,
+    ) -> Result<T, ToolError> {
+        self.call_json_field_for_generation(tool, args, field, timeout_secs, None)
+            .await
+    }
+
+    async fn call_json_field_for_generation<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        field: &'static str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<T, ToolError> {
+        let value = self
+            .call_value_for_generation(tool, args, timeout_secs, None, expected_generation)
+            .await?;
+        let Some(field_value) = value.get(field).cloned() else {
+            return Err(ToolError::RemoteProtocol(format!(
+                "child tool {tool} response did not contain `{field}`"
+            )));
+        };
+        serde_json::from_value(field_value).map_err(|err| {
+            ToolError::RemoteProtocol(format!("invalid {tool}.{field} response: {err}"))
+        })
     }
 
     async fn call_text(
@@ -923,7 +1033,9 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<String, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, None)
+            .await?;
         remote::result_text(&result, tool)
     }
 
@@ -939,11 +1051,48 @@ impl PooledSessionState {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
         timeout_secs: Option<u64>,
         _progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
-        let (handle, fresh_lease) = self.lease_for_open().await?;
+        self.open_observed_with_generation(
+            path,
+            load_debug_info,
+            debug_info_path,
+            debug_info_verbose,
+            force,
+            rebuild,
+            file_type,
+            auto_analyse,
+            extra_args,
+            idb_out,
+            timeout_secs,
+            _progress_tx,
+            cancel,
+        )
+        .await
+        .map(|opened| opened.info)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_observed_with_generation(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        rebuild: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        idb_out: Option<String>,
+        timeout_secs: Option<u64>,
+        _progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<OpenedDatabase, ToolError> {
+        let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         let result = handle
             .call_tool(
@@ -958,6 +1107,7 @@ impl PooledSessionState {
                     file_type,
                     auto_analyse,
                     extra_args,
+                    idb_out,
                     timeout_secs,
                 ))?,
                 timeout,
@@ -969,7 +1119,7 @@ impl PooledSessionState {
             Ok(info) => {
                 let mut child = handle.slot.child.lock().await;
                 child.idb_path = Some(PathBuf::from(&info.path));
-                Ok(info)
+                Ok(OpenedDatabase { info, generation })
             }
             Err(err) => {
                 if open_error_releases_lease(fresh_lease, &err) {
@@ -980,41 +1130,32 @@ impl PooledSessionState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        &self,
-        path: &str,
-        load_debug_info: bool,
-        debug_info_path: Option<String>,
-        debug_info_verbose: bool,
-        force: bool,
-        rebuild: bool,
-        file_type: Option<String>,
-        auto_analyse: bool,
-        extra_args: Vec<String>,
-    ) -> Result<DbInfo, ToolError> {
-        self.open_observed(
-            path,
-            load_debug_info,
-            debug_info_path,
-            debug_info_verbose,
-            force,
-            rebuild,
-            file_type,
-            auto_analyse,
-            extra_args,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     pub async fn close(&self) -> Result<(), ToolError> {
-        let Some(handle) = self.take_handle().await else {
+        let Some(lease) = self.take_handle().await else {
             return Err(ToolError::NoDatabaseOpen);
         };
-        self.pool.release(handle).await
+        self.pool.release(lease.handle).await
+    }
+
+    pub(crate) async fn close_if_generation(
+        &self,
+        generation: DatabaseGeneration,
+    ) -> Result<ConditionalCloseResult, ToolError> {
+        let lease = {
+            let mut guard = self.handle.lock().await;
+            if guard
+                .as_ref()
+                .is_none_or(|lease| lease.generation != generation)
+            {
+                return Ok(ConditionalCloseResult::NotCurrent);
+            }
+            guard.take()
+        };
+        let Some(lease) = lease else {
+            return Ok(ConditionalCloseResult::NotCurrent);
+        };
+        self.pool.release(lease.handle).await?;
+        Ok(ConditionalCloseResult::Closed)
     }
 
     pub async fn load_debug_info(
@@ -1032,8 +1173,60 @@ impl PooledSessionState {
     }
 
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
-        self.call_json("analysis_status", json!({}), None, None)
+        self.analysis_status_for_generation(None).await
+    }
+
+    pub(crate) async fn analysis_status_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<AnalysisStatus, ToolError> {
+        self.call_json_for_generation(
+            "analysis_status",
+            json!({}),
+            None,
+            None,
+            expected_generation,
+        )
+        .await
+    }
+
+    pub async fn dsc_load_image(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageInfo, ToolError> {
+        self.dsc_load_image_for_generation(module, timeout_secs, None)
             .await
+    }
+
+    pub(crate) async fn dsc_load_image_for_generation(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<DscImageInfo, ToolError> {
+        self.call_json_field_for_generation(
+            "dsc_add_dylib",
+            json!({ "module": module, "timeout_secs": timeout_secs }),
+            "image",
+            timeout_secs,
+            expected_generation,
+        )
+        .await
+    }
+
+    pub async fn dsc_load_region(
+        &self,
+        addr: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscRegionInfo, ToolError> {
+        self.call_json_field(
+            "dsc_add_region",
+            json!({ "address": remote::hex_addr(addr), "timeout_secs": timeout_secs }),
+            "region",
+            timeout_secs,
+        )
+        .await
     }
 
     pub async fn list_functions(
@@ -1323,21 +1516,43 @@ impl PooledSessionState {
         .await
     }
 
-    pub async fn xrefs_to(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_to(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         self.call_json(
             "xrefs_to",
-            json!({ "address": remote::hex_addr(addr) }),
-            None,
+            json!({
+                "address": remote::hex_addr(addr),
+                "offset": offset,
+                "limit": limit,
+                "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
             None,
         )
         .await
     }
 
-    pub async fn xrefs_from(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_from(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         self.call_json(
             "xrefs_from",
-            json!({ "address": remote::hex_addr(addr) }),
-            None,
+            json!({
+                "address": remote::hex_addr(addr),
+                "offset": offset,
+                "limit": limit,
+                "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
             None,
         )
         .await
@@ -1382,6 +1597,44 @@ impl PooledSessionState {
 
     pub async fn entrypoints(&self) -> Result<Vec<String>, ToolError> {
         self.call_json("entrypoints", json!({}), None, None).await
+    }
+
+    pub async fn lumina_lookup(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "lumina_lookup",
+            json!({
+                "address": remote::opt_hex_addr(addr),
+                "target_name": name,
+                "offset": offset,
+                "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn lumina_apply(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        force: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "lumina_apply",
+            lumina_apply_child_args(addr, name, offset, force),
+            timeout_secs,
+            None,
+        )
+        .await
     }
 
     pub async fn get_bytes(
@@ -1709,7 +1962,7 @@ impl PooledSessionState {
             _ => {
                 return Err(ToolError::InvalidParams(format!(
                     "unsupported integer size: {size}"
-                )))
+                )));
             }
         };
         self.call_value(
@@ -1845,10 +2098,10 @@ impl Drop for PooledSessionState {
             return;
         };
         runtime.spawn(async move {
-            let Some(handle) = handle_slot.lock().await.take() else {
+            let Some(lease) = handle_slot.lock().await.take() else {
                 return;
             };
-            let _ = pool.release(handle).await;
+            let _ = pool.release(lease.handle).await;
         });
     }
 }
@@ -1864,6 +2117,7 @@ fn open_idb_child_args(
     file_type: Option<String>,
     auto_analyse: bool,
     extra_args: Vec<String>,
+    idb_out: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Value {
     json!({
@@ -1876,6 +2130,7 @@ fn open_idb_child_args(
         "file_type": file_type,
         "auto_analyse": auto_analyse,
         "_worker_extra_args": extra_args,
+        "_worker_idb_out": idb_out,
         "timeout_secs": timeout_secs,
     })
 }
@@ -1890,6 +2145,24 @@ fn analyze_funcs_child_args(timeout_secs: Option<u64>, worker_no_timeout: bool) 
 
 fn run_script_child_args(code: &str, timeout_secs: Option<u64>) -> Value {
     json!({ "code": code, "timeout_secs": timeout_secs })
+}
+
+fn lumina_apply_child_args(
+    addr: Option<u64>,
+    name: Option<String>,
+    offset: i64,
+    force: bool,
+) -> Value {
+    json!({
+        "address": remote::opt_hex_addr(addr),
+        "target_name": name,
+        "offset": offset,
+        "force": force,
+        // The child must not report a timeout while IDA is still mutating its
+        // database. The parent watchdog owns timeout enforcement and kills the
+        // child before returning a timeout to the caller.
+        "timeout_secs": null,
+    })
 }
 
 fn find_bytes_child_args(pattern: String, max_results: usize, timeout_secs: Option<u64>) -> Value {
@@ -1947,6 +2220,32 @@ fn extract_first_matches(value: Value, tool: &'static str) -> Result<Value, Tool
         ))
     })?;
     Ok(json!({ "matches": matches }))
+}
+
+/// Decide whether an operation bound to `expected` may run against the lease
+/// currently held at `current`.
+///
+/// `None` opts out, for foreground tools that legitimately target whatever
+/// database the session has open. `Some` binds the operation to one database
+/// lifetime so a close/reopen refuses it instead of redirecting it onto the
+/// new lease. The caller evaluates this while holding the lease lock, so the
+/// decision cannot be invalidated between here and dispatch.
+fn require_lease_generation(
+    current: DatabaseGeneration,
+    expected: Option<DatabaseGeneration>,
+) -> Result<(), ToolError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if current == expected {
+        return Ok(());
+    }
+    warn!(
+        expected_generation = expected.0,
+        current_generation = current.0,
+        "Refusing a pooled operation bound to a replaced database generation"
+    );
+    Err(ToolError::DatabaseReplaced)
 }
 
 fn release_error_retires_worker(err: &ToolError) -> bool {
@@ -2038,10 +2337,11 @@ mod tests {
     use crate::error::ToolError;
     use crate::ida::pool::{
         analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
-        find_bytes_child_args, open_error_releases_lease, open_idb_child_args,
-        release_error_retires_worker, run_script_child_args, search_child_args, WorkerPool,
-        WorkerPoolConfig,
+        find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
+        open_idb_child_args, release_error_retires_worker, require_lease_generation,
+        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig,
     };
+    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -2053,8 +2353,27 @@ mod tests {
             worker_idle_timeout: Duration::from_secs(300),
             worker_op_timeout: Duration::from_secs(600),
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
-            filter_args: Vec::new(),
+            worker_args: Vec::new(),
         })
+    }
+
+    #[test]
+    fn pooled_child_workers_ignore_public_tool_filters() {
+        let pool = test_pool(1);
+        let cmd = pool.worker_command();
+        let cleared: Vec<&str> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(key, _)| key.to_str())
+            .collect();
+
+        for var in crate::ida::pool::CHILD_FILTER_ENV_VARS {
+            assert!(
+                cleared.contains(var),
+                "pooled child workers must not inherit {var}; they need lifecycle tools"
+            );
+        }
     }
 
     #[test]
@@ -2065,7 +2384,7 @@ mod tests {
             worker_idle_timeout: Duration::from_secs(300),
             worker_op_timeout: Duration::from_secs(1800),
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
-            filter_args: Vec::new(),
+            worker_args: Vec::new(),
         });
 
         assert_eq!(pool.worker_op_timeout(Some(120)), Duration::from_secs(130));
@@ -2089,10 +2408,12 @@ mod tests {
             Some("pe".to_string()),
             true,
             vec!["-A".to_string()],
+            Some("/tmp/a.out.i64".to_string()),
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
+        assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);
         assert_eq!(analyze_args["timeout_secs"], json!(600));
@@ -2104,6 +2425,17 @@ mod tests {
 
         let script_args = run_script_child_args("print(1)", Some(30));
         assert_eq!(script_args["timeout_secs"], json!(30));
+    }
+
+    #[test]
+    fn pooled_lumina_apply_leaves_timeout_to_parent_watchdog() {
+        let args = lumina_apply_child_args(Some(0x401000), Some("target".to_string()), 4, true);
+
+        assert!(args["timeout_secs"].is_null());
+        assert_eq!(args["address"], json!("0x401000"));
+        assert_eq!(args["target_name"], json!("target"));
+        assert_eq!(args["offset"], json!(4));
+        assert_eq!(args["force"], json!(true));
     }
 
     #[test]
@@ -2181,6 +2513,64 @@ mod tests {
                 worker_id: 7,
                 last_op: "open_idb".to_string(),
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn conditional_close_without_matching_pooled_generation_is_a_noop() {
+        let state =
+            crate::ida::pool::PooledSessionState::new(test_pool(1), "generation-test".to_string());
+
+        assert_eq!(
+            state
+                .close_if_generation(DatabaseGeneration(1))
+                .await
+                .expect("a missing generation should be a successful no-op"),
+            ConditionalCloseResult::NotCurrent
+        );
+    }
+
+    /// The close/reopen redirect: a background task holds the generation it
+    /// opened, its session closes and reopens, and the task's next post-open
+    /// call must be refused rather than resolved against the new lease.
+    ///
+    /// Every pooled post-open call resolves its worker through
+    /// `required_handle_for_generation`, which applies this decision while
+    /// holding the lease lock, so a concurrent close cannot slip between the
+    /// check and the dispatch.
+    #[test]
+    fn post_open_call_is_refused_after_its_lease_is_replaced() {
+        let opened = DatabaseGeneration(1);
+        let after_reopen = DatabaseGeneration(2);
+
+        // The task's own database: its remaining work proceeds.
+        assert!(require_lease_generation(opened, Some(opened)).is_ok());
+
+        // After a close/reopen the lease names a different database; the stale
+        // task must be refused instead of silently mutating the new one.
+        match require_lease_generation(after_reopen, Some(opened)) {
+            Err(ToolError::DatabaseReplaced) => {}
+            Err(other) => panic!("expected DatabaseReplaced, got {other}"),
+            Ok(()) => panic!("a replaced lease must refuse the stale operation"),
+        }
+
+        // The session that owns the new database is unaffected.
+        assert!(require_lease_generation(after_reopen, Some(after_reopen)).is_ok());
+
+        // Foreground tools opt out and follow the current lease.
+        assert!(require_lease_generation(after_reopen, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn bound_call_reports_no_database_rather_than_a_redirect() {
+        let state =
+            crate::ida::pool::PooledSessionState::new(test_pool(1), "redirect-test".to_string());
+
+        assert!(matches!(
+            state
+                .required_handle_for_generation(Some(DatabaseGeneration(1)))
+                .await,
+            Err(ToolError::NoDatabaseOpen)
         ));
     }
 

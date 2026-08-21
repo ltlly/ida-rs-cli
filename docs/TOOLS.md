@@ -5,10 +5,10 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 71 tools)
+- `tools/list` returns the full tool set (currently 73 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
-- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
+- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires the close_token from `open_idb` unless the request is in the owning legacy session)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
 auto-analyzed and saved as a .i64 alongside the input. If that generated .i64
@@ -24,7 +24,7 @@ Database open/close and discovery tools
 |------|-------------|
 | `analysis_status` | Report auto-analysis status |
 | `close_idb` | Close the current database (release locks) |
-| `dsc_add_dylib` | Load an additional dylib into an open DSC database (light analysis only) |
+| `dsc_add_dylib` | Load an additional dylib into an open DSC database |
 | `dsc_add_region` | Load a DSC memory region by address (data/GOT/stubs) |
 | `idb_meta` | Get database metadata and summary |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
@@ -132,6 +132,7 @@ Database info, segments, imports, exports
 | `exports` | List exported functions |
 | `imports` | List imported functions |
 | `list_globals` | List global variables |
+| `lumina_lookup` | Look up Lumina metadata for a function |
 | `segments` | List all segments |
 
 ## Types (`types`)
@@ -158,6 +159,7 @@ Patching, renaming, and comment editing
 
 | Tool | Description |
 |------|-------------|
+| `lumina_apply` | Apply Lumina metadata to a function |
 | `patch` | Patch bytes at an address |
 | `patch_asm` | Patch instructions with assembly text |
 | `rename` | Rename symbols |

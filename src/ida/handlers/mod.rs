@@ -6,9 +6,11 @@ pub mod annotations;
 pub mod controlflow;
 pub mod database;
 pub mod disasm;
+pub mod dscu;
 pub mod functions;
 pub mod globals;
 pub mod imports;
+pub mod lumina;
 pub mod memory;
 pub mod script;
 pub mod search;
@@ -54,10 +56,10 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 pub(crate) fn resolve_address_by_name(idb: &Option<IDB>, name: &str) -> Result<u64, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                return Ok(func.start_address());
-            }
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            return Ok(func.start_address());
         }
     }
     for item in db.names().iter() {

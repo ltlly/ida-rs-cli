@@ -43,6 +43,9 @@ pub struct OpenIdbRequest {
     #[serde(default, rename = "_worker_extra_args")]
     #[schemars(skip)]
     pub worker_extra_args: Vec<String>,
+    #[serde(default, rename = "_worker_idb_out")]
+    #[schemars(skip)]
+    pub worker_idb_out: Option<String>,
 }
 
 impl OpenIdbRequest {
@@ -95,6 +98,7 @@ mod tests {
             auto_analyse: None,
             timeout_secs: None,
             worker_extra_args: Vec::new(),
+            worker_idb_out: None,
         }
     }
 
@@ -118,11 +122,13 @@ mod tests {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CloseIdbRequest {
-    #[schemars(description = "Ownership token returned by open_idb (required for HTTP/SSE).")]
+    #[schemars(
+        description = "Ownership token returned by open_idb. Required when an HTTP/SSE request is not in the owning legacy session; sessionless MCP 2026 clients should provide it unless force=true is used for trusted recovery."
+    )]
     #[serde(alias = "close_token", alias = "owner_token")]
     pub token: Option<String>,
     #[schemars(
-        description = "Force-close the database even if the original HTTP owner session or token was lost. Use only for recovery."
+        description = "Force-close the database when the original HTTP close token was lost. Use only from a trusted client for recovery."
     )]
     #[serde(alias = "recover", alias = "override_owner")]
     pub force: Option<bool>,
@@ -470,6 +476,59 @@ pub struct AddressRequest {
     #[schemars(description = "Address(es) (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
     pub address: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LuminaLookupRequest {
+    #[schemars(description = "Function address (string/number)")]
+    #[serde(alias = "ea", alias = "addr", alias = "addresses")]
+    pub address: Option<Value>,
+    #[schemars(description = "Function name (alternative to address)")]
+    #[serde(alias = "function", alias = "name", alias = "symbol")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
+    pub offset: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default: 120, max: 600)")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LuminaApplyRequest {
+    #[schemars(description = "Function address (string/number)")]
+    #[serde(alias = "ea", alias = "addr", alias = "addresses")]
+    pub address: Option<Value>,
+    #[schemars(description = "Function name (alternative to address)")]
+    #[serde(alias = "function", alias = "name", alias = "symbol")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
+    pub offset: Option<i64>,
+    #[schemars(
+        description = "Force all returned metadata, potentially replacing existing names or types (default: false)"
+    )]
+    pub force: Option<bool>,
+    #[schemars(
+        description = "Timeout in seconds. Pooled mode kills and retires the child on timeout; single-worker mode waits for this non-cancellable mutation to finish."
+    )]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct XrefsRequest {
+    #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+    #[schemars(description = "Maximum xrefs to return per address (1-10000, default: 1000)")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 1, max = 10000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Offset for pagination (default: 0)")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -848,7 +907,7 @@ pub struct OpenDscRequest {
     #[schemars(range(min = 8, max = 9))]
     pub ida_version: Option<i64>,
     #[schemars(
-        description = "Path for idat's log file (-L). Useful for debugging DSC load failures."
+        description = "Path for idat's log file (-L). Used only by the legacy pre-IDA-9.4 DSC path."
     )]
     pub log_path: Option<String>,
 }

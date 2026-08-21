@@ -11,11 +11,12 @@ use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
-    build_pooled_session_manager, build_session_manager, build_streamable_config, HttpServerOptions,
+    build_pooled_session_manager, build_session_manager, build_streamable_config,
+    HttpServerOptions, DEFAULT_MAX_REQUEST_BODY_MIB,
 };
 use ida_mcp::server::task::TaskRegistry;
 use ida_mcp::server::tool_filter::ToolFilter;
-use ida_mcp::server::SanitizedIdaServer;
+use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
 use ida_mcp::{
     disasm::generate_disasm_line,
     expand_path, ida,
@@ -47,6 +48,8 @@ const DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
 struct Cli {
     #[command(flatten)]
     filter: ToolFilterArgs,
+    #[command(flatten)]
+    ida_network: IdaNetworkArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -113,25 +116,28 @@ impl ToolFilterArgs {
         )
         .map_err(|e| e.to_string())
     }
+}
 
-    fn child_args(&self) -> Vec<OsString> {
-        let mut args = Vec::new();
-        if !self.toolsets.is_empty() {
-            args.push(OsString::from("--toolsets"));
-            args.push(OsString::from(self.toolsets.join(",")));
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "IDA network")]
+struct IdaNetworkArgs {
+    /// Allow IDA to contact configured Lumina servers.
+    #[arg(
+        long,
+        env = "IDA_MCP_ALLOW_LUMINA",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_lumina: bool,
+}
+
+impl IdaNetworkArgs {
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.allow_lumina {
+            vec![OsString::from("--allow-lumina")]
+        } else {
+            Vec::new()
         }
-        if !self.tools.is_empty() {
-            args.push(OsString::from("--tools"));
-            args.push(OsString::from(self.tools.join(",")));
-        }
-        if !self.exclude_tools.is_empty() {
-            args.push(OsString::from("--exclude-tools"));
-            args.push(OsString::from(self.exclude_tools.join(",")));
-        }
-        if self.read_only {
-            args.push(OsString::from("--read-only"));
-        }
-        args
     }
 }
 
@@ -152,9 +158,20 @@ struct ServeHttpArgs {
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
-    /// Return application/json in stateless mode instead of SSE framing.
+    /// Prefer application/json over SSE framing for sessionless responses
+    /// (--stateless mode and all MCP 2026 requests).
     #[arg(long)]
     json_response: bool,
+    /// Maximum accepted request body, in MiB. Bulk `patch` (binary as hex,
+    /// ~2x the raw size) and large `run_script` sources need headroom; the
+    /// endpoint is unauthenticated and each in-flight request can retain up
+    /// to this much, so raise it deliberately.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_REQUEST_BODY_MIB,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1024),
+    )]
+    max_request_body_mib: usize,
     /// Allowed Origin values (comma-separated). Defaults to localhost only.
     #[arg(
         long,
@@ -239,12 +256,17 @@ fn main() -> anyhow::Result<()> {
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
-    let child_filter_args = cli.filter.child_args();
+    let allow_lumina = cli.ida_network.allow_lumina;
+    let worker_args = cli.ida_network.worker_args();
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => run_server(build_filter()?),
-        Command::ServeHttp(args) => run_server_http(args, build_filter()?, child_filter_args),
-        Command::Worker(_args) => run_server_with_mode(build_filter()?, ServerMode::Worker),
-        Command::Probe(args) => run_probe(args),
+        Command::Serve => run_server(build_filter()?, allow_lumina),
+        Command::ServeHttp(args) => {
+            run_server_http(args, build_filter()?, worker_args, allow_lumina)
+        }
+        Command::Worker(_args) => {
+            run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
+        }
+        Command::Probe(args) => run_probe(args, allow_lumina),
     }
 }
 
@@ -272,46 +294,66 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
+fn init_stdio_ida_state(allow_lumina: bool) -> anyhow::Result<ida::IdaInitState> {
     // On Windows, IDA's init_library() probes console handles during
     // startup. In stdio mode the MCP transport captures stdin/stdout
     // for JSON-RPC framing, so init must run *before* the transport
     // starts — otherwise init_library() deadlocks on the owned handle.
     #[cfg(target_os = "windows")]
     {
-        ida::init_ida_library()
+        ida::init_ida_library(allow_lumina)
             .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(ida::IdaInitState::deferred())
+        ida::IdaInitState::deferred(allow_lumina)
+            .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))
     }
 }
 
-fn pooled_child_filter_args(_parent_filter_args: &[OsString]) -> Vec<OsString> {
-    // Public tool filtering is enforced by the parent HTTP server. Child workers
-    // are private implementation details and must keep lifecycle/internal tools
-    // such as close_idb and analyze_funcs available for the parent.
-    Vec::new()
+/// Bounded worker shutdown. If IDA is wedged inside auto_wait() these
+/// requests sit behind it and the process can stay alive indefinitely
+/// (issue #32). After the timeout we forcibly exit so the OS reclaims
+/// IDA's mmap'd memory regardless. 124 matches GNU `timeout`'s "did its
+/// best, timed out" convention.
+async fn shutdown_worker_bounded(worker: &WorkerBackend) {
+    const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+    let close_result =
+        tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.close_for_shutdown()).await;
+    let shutdown_result = tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.shutdown()).await;
+    if close_result.is_err() || shutdown_result.is_err() {
+        warn!(
+            timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
+            close_timed_out = close_result.is_err(),
+            shutdown_timed_out = shutdown_result.is_err(),
+            "IDA worker shutdown timed out (likely wedged in auto_wait); \
+             forcing process exit to release IDA-side memory"
+        );
+        std::process::exit(124);
+    }
 }
 
 fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
-    let cancelled = registry.cancel_all_running(message);
-    if cancelled > 0 {
+    let requested = registry.cancel_all_running(message);
+    if requested > 0 {
         info!(
-            cancelled_tasks = cancelled,
-            message, "Cancelled background tasks"
+            cancellation_requests = requested,
+            message, "Requested background task cancellation"
         );
     }
 }
 
-fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
-    run_server_with_mode(filter, ServerMode::Stdio)
+fn run_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
+    run_server_with_mode(filter, ServerMode::Stdio, allow_lumina)
 }
 
-fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Result<()> {
+fn run_server_with_mode(
+    filter: Arc<ToolFilter>,
+    mode: ServerMode,
+    allow_lumina: bool,
+) -> anyhow::Result<()> {
     info!(?mode, "Starting IDA MCP Server (stdio transport)");
-    let init_state = init_stdio_ida_state()?;
+    let init_state = init_stdio_ida_state(allow_lumina)?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -338,7 +380,18 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
             );
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
-            let mut service = Some(sanitized.serve(stdio()).await?);
+            let mut service = match sanitized.serve(stdio()).await {
+                Ok(running) => Some(running),
+                Err(e) => {
+                    // rmcp fails the serve future without answering the client
+                    // when the first message is not a valid initialize/discover
+                    // request. Shut the IDA worker down so the process exits
+                    // instead of wedging with an unread stdin.
+                    error!(error = %e, "stdio MCP negotiation failed; shutting down IDA worker");
+                    shutdown_worker_bounded(&worker_for_shutdown).await;
+                    return Err(anyhow::anyhow!("stdio MCP negotiation failed: {e}"));
+                }
+            };
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
 
@@ -369,56 +422,30 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                        if let Some(running) = service.as_ref() {
-                            if running.is_transport_closed() {
-                                cancel_background_tasks(
-                                    &task_registry,
-                                    "Cancelled by client disconnect",
+                        if let Some(running) = service.as_ref()
+                            && running.is_transport_closed()
+                        {
+                            cancel_background_tasks(
+                                &task_registry,
+                                "Cancelled by client disconnect",
+                            );
+                            if let Some(mut running) = service.take()
+                                && running
+                                    .close_with_timeout(Duration::from_secs(2))
+                                    .await?
+                                    .is_none()
+                            {
+                                warn!(
+                                    "Timed out waiting for stdio transport cleanup after client disconnect"
                                 );
-                                if let Some(mut running) = service.take() {
-                                    if running
-                                        .close_with_timeout(Duration::from_secs(2))
-                                        .await?
-                                        .is_none()
-                                    {
-                                        warn!(
-                                            "Timed out waiting for stdio transport cleanup after client disconnect"
-                                        );
-                                    }
-                                }
-                                break;
                             }
+                            break;
                         }
                     }
                 }
             }
             info!("MCP server shutting down");
-            // Bounded worker shutdown. If IDA is wedged inside auto_wait()
-            // these requests sit behind it and the process can stay alive
-            // indefinitely (issue #32). After the timeout we forcibly exit
-            // so the OS reclaims IDA's mmap'd memory regardless. 124
-            // matches GNU `timeout`'s "did its best, timed out" convention.
-            const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-            let close_result = tokio::time::timeout(
-                WORKER_SHUTDOWN_TIMEOUT,
-                worker_for_shutdown.close_for_shutdown(),
-            )
-            .await;
-            let shutdown_result = tokio::time::timeout(
-                WORKER_SHUTDOWN_TIMEOUT,
-                worker_for_shutdown.shutdown(),
-            )
-            .await;
-            if close_result.is_err() || shutdown_result.is_err() {
-                warn!(
-                    timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
-                    close_timed_out = close_result.is_err(),
-                    shutdown_timed_out = shutdown_result.is_err(),
-                    "IDA worker shutdown timed out (likely wedged in auto_wait); \
-                     forcing process exit to release IDA-side memory"
-                );
-                std::process::exit(124);
-            }
+            shutdown_worker_bounded(&worker_for_shutdown).await;
             Ok::<_, anyhow::Error>(())
         })
     });
@@ -429,10 +456,18 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
     info!("IDA worker loop finished");
 
     // Wait for server thread to finish
+    // Propagate server-thread failures (e.g. stdio negotiation errors) into
+    // the process exit status so supervisors can tell them from clean shutdown.
     match server_handle.join() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Server thread failed: {e}"),
-        Err(e) => error!("Server thread panicked: {:?}", e),
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Server stopped");
@@ -442,11 +477,12 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
 fn run_server_http(
     args: ServeHttpArgs,
     filter: Arc<ToolFilter>,
-    child_filter_args: Vec<OsString>,
+    worker_args: Vec<OsString>,
+    allow_lumina: bool,
 ) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
     if args.json_response && !args.stateless {
-        info!("--json-response is ignored unless --stateless is also set");
+        info!("--json-response applies to sessionless dispatch (MCP 2026 requests); legacy sessions keep SSE framing for streams");
     }
     if args.max_workers == 0 {
         return Err(anyhow::anyhow!("--max-workers must be at least 1"));
@@ -479,7 +515,7 @@ fn run_server_http(
         return run_server_http_pooled(
             args,
             filter,
-            child_filter_args,
+            worker_args,
             bind_addr,
             session_keep_alive_secs,
         );
@@ -490,7 +526,8 @@ fn run_server_http(
          Pass --max-workers N where N > 1 for concurrent multi-IDB analysis."
     );
 
-    let init_state = ida::IdaInitState::deferred();
+    let init_state = ida::IdaInitState::deferred(allow_lumina)
+        .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))?;
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = Arc::new(IdaWorker::new(tx));
     let backend = WorkerBackend::local(worker.clone());
@@ -498,17 +535,17 @@ fn run_server_http(
     let worker_for_factory = backend.clone();
     let worker_for_shutdown = backend.clone();
     let filter_for_factory = filter.clone();
-    let server_handle = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
+    let runtime_state = if args.stateless {
+        ServerRuntimeState::new_stateless_http()
+    } else {
+        ServerRuntimeState::new()
+    };
+    let worker_for_startup_failure = backend.clone();
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime: {e}");
-                return;
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
 
         let result = rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -532,16 +569,18 @@ fn run_server_http(
                     sse_keep_alive_secs: args.sse_keep_alive_secs,
                     stateless: args.stateless,
                     json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
                 },
                 cancel.clone(),
             );
 
             let service = StreamableHttpService::new(
                 move || {
-                    let inner = IdaMcpServer::with_filter(
+                    let inner = IdaMcpServer::with_filter_and_state(
                         worker_for_factory.clone(),
                         ServerMode::Http,
                         filter_for_factory.clone(),
+                        runtime_state.clone(),
                     );
                     Ok(SanitizedIdaServer::with_filter(
                         inner,
@@ -577,17 +616,32 @@ fn run_server_http(
                 .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
             Ok::<_, anyhow::Error>(())
         });
-        if let Err(err) = result {
+        if let Err(err) = &result {
             error!("HTTP server error: {err}");
+            // The main thread is parked in run_ida_loop and nothing else will
+            // send it a shutdown request, so a failed startup would otherwise
+            // wedge the process alive holding an IDA license with no listener.
+            rt.block_on(shutdown_worker_bounded(&worker_for_startup_failure));
         }
+        result
     });
 
     info!("Starting IDA worker loop");
     ida::run_ida_loop(rx, init_state);
     info!("IDA worker loop finished");
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
+    // Propagate startup/serve failures into the exit status so supervisors can
+    // tell "could not start" from a clean shutdown.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Server stopped");
@@ -597,7 +651,7 @@ fn run_server_http(
 fn run_server_http_pooled(
     args: ServeHttpArgs,
     filter: Arc<ToolFilter>,
-    child_filter_args: Vec<OsString>,
+    worker_args: Vec<OsString>,
     bind_addr: SocketAddr,
     session_keep_alive_secs: u64,
 ) -> anyhow::Result<()> {
@@ -606,17 +660,11 @@ fn run_server_http_pooled(
         min_workers = args.min_workers,
         "Starting pooled HTTP router; parent will not initialize IDA"
     );
-    let server_handle = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime: {e}");
-                return;
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
 
         let result = rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -641,7 +689,9 @@ fn run_server_http_pooled(
                 worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
                 worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
                 exe_path,
-                filter_args: pooled_child_filter_args(&child_filter_args),
+                // Public tool filtering stays in the parent so private workers
+                // retain lifecycle tools. Process-wide options still propagate.
+                worker_args,
             });
             pool.warm_min()
                 .await
@@ -662,6 +712,7 @@ fn run_server_http_pooled(
                     sse_keep_alive_secs: args.sse_keep_alive_secs,
                     stateless: args.stateless,
                     json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
                 },
                 cancel.clone(),
             );
@@ -714,26 +765,37 @@ fn run_server_http_pooled(
             pool.shutdown_all().await;
             Ok::<_, anyhow::Error>(())
         });
-        if let Err(err) = result {
-            error!("HTTP server error: {err}");
+        if let Err(err) = &result {
+            error!("Pooled HTTP server error: {err}");
         }
+        result
     });
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
+    // Same contract as single-worker HTTP and stdio: a server that never
+    // started must not report success.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Pooled HTTP server stopped");
     Ok(())
 }
 
-fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
+fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (probe mode)");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    idalib::init_library()
+    let _init_state = ida::init_ida_library(allow_lumina)
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
@@ -933,16 +995,16 @@ fn list_functions(db: &IDB, offset: usize, limit: usize) -> ida_mcp::FunctionLis
 
 fn resolve_function(db: &IDB, name: &str) -> anyhow::Result<FunctionInfo> {
     for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                let addr = func.start_address();
-                let size = func.len();
-                return Ok(FunctionInfo {
-                    address: format!("{:#x}", addr),
-                    name: func_name,
-                    size,
-                });
-            }
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            let addr = func.start_address();
+            let size = func.len();
+            return Ok(FunctionInfo {
+                address: format!("{:#x}", addr),
+                name: func_name,
+                size,
+            });
         }
     }
 
@@ -987,14 +1049,14 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pooled_child_filter_args, Cli, Command, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
+    use crate::{Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
     use clap::Parser;
     use std::ffi::OsString;
 
     #[test]
     fn http_session_keep_alive_default_is_thirty_minutes() {
         let cli = Cli::parse_from(["ida-mcp", "serve-http"]);
-        let Command::ServeHttp(args) = cli.command.expect("subcommand") else {
+        let crate::Command::ServeHttp(args) = cli.command.expect("subcommand") else {
             panic!("expected serve-http")
         };
         assert_eq!(
@@ -1005,16 +1067,21 @@ mod tests {
     }
 
     #[test]
-    fn pooled_child_workers_ignore_public_tool_filters() {
-        let parent_args = vec![
-            OsString::from("--read-only"),
-            OsString::from("--tools"),
-            OsString::from("open_idb,list_functions"),
-        ];
+    fn lumina_access_is_disabled_by_default() {
+        let cli = Cli::parse_from(["ida-mcp", "serve"]);
 
-        assert!(
-            pooled_child_filter_args(&parent_args).is_empty(),
-            "pooled child workers must keep private lifecycle tools available"
-        );
+        assert!(!cli.ida_network.allow_lumina);
+        assert!(cli.ida_network.worker_args().is_empty());
+    }
+
+    #[test]
+    fn lumina_access_can_be_enabled_globally() {
+        let before_subcommand = Cli::parse_from(["ida-mcp", "--allow-lumina", "worker"]);
+        let after_subcommand = Cli::parse_from(["ida-mcp", "worker", "--allow-lumina"]);
+
+        assert!(before_subcommand.ida_network.allow_lumina);
+        assert!(after_subcommand.ida_network.allow_lumina);
+        let worker_args = vec![OsString::from("--allow-lumina")];
+        assert_eq!(before_subcommand.ida_network.worker_args(), worker_args);
     }
 }

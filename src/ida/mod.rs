@@ -9,6 +9,8 @@ pub mod lock;
 mod loop_impl;
 pub mod observability;
 pub mod pool;
+#[cfg(target_os = "windows")]
+mod registry_isolation;
 mod remote;
 pub mod request;
 pub mod types;

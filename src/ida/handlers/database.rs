@@ -80,6 +80,16 @@ fn existing_idb_for_raw_binary(path: &Path) -> Option<PathBuf> {
     idb_path.exists().then_some(idb_path)
 }
 
+fn existing_idb_for_raw_open(path: &Path, explicit_idb_out: Option<&Path>) -> Option<PathBuf> {
+    if let Some(explicit_idb_out) = explicit_idb_out {
+        explicit_idb_out
+            .exists()
+            .then_some(explicit_idb_out.to_path_buf())
+    } else {
+        existing_idb_for_raw_binary(path)
+    }
+}
+
 fn has_ida_database_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -96,13 +106,12 @@ fn raw_input_matches_generated_database(raw: &Path, database: &Path) -> bool {
 
 fn base_input_path_for_database(path: &Path) -> PathBuf {
     let mut base = path.to_path_buf();
-    if let Some(ext) = base.extension().and_then(|e| e.to_str()) {
-        if ext.eq_ignore_ascii_case("i64")
+    if let Some(ext) = base.extension().and_then(|e| e.to_str())
+        && (ext.eq_ignore_ascii_case("i64")
             || ext.eq_ignore_ascii_case("idb")
-            || ext.eq_ignore_ascii_case("id0")
-        {
-            base.set_extension("");
-        }
+            || ext.eq_ignore_ascii_case("id0"))
+    {
+        base.set_extension("");
     }
     base
 }
@@ -144,6 +153,7 @@ pub fn handle_open(
     file_type: Option<&str>,
     auto_analyse: bool,
     extra_args: &[String],
+    idb_out: Option<&str>,
     progress_tx: Option<ProgressSender>,
     cancel: Option<CancellationToken>,
 ) -> Result<DbInfo, ToolError> {
@@ -188,8 +198,11 @@ pub fn handle_open(
     let mut dsym_path = None;
     let mut should_load_dsym = false;
     if !is_idb {
-        let out_path = idb_path_for_raw_binary(&expanded);
-        let generated_idb_path = existing_idb_for_raw_binary(&expanded);
+        let explicit_idb_out = idb_out.map(expand_path);
+        let out_path = explicit_idb_out
+            .clone()
+            .unwrap_or_else(|| idb_path_for_raw_binary(&expanded));
+        let generated_idb_path = existing_idb_for_raw_open(&expanded, explicit_idb_out.as_deref());
         let generated_exists = generated_idb_path.is_some();
         if let Some(generated_idb_path) = generated_idb_path.filter(|_| !rebuild) {
             info!(
@@ -283,19 +296,18 @@ pub fn handle_open(
             opts.arg(arg);
         }
         let mut db = opts.open(db_path_to_open);
-        if db.is_err() {
-            if let Some(id0_path) = unpacked_id0_path(db_path_to_open) {
-                if id0_path.exists() {
-                    info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
-                    opened_path = id0_path.clone();
-                    let mut opts = IDBOpenOptions::new();
-                    opts.auto_analyse(false).save(true);
-                    for arg in &init_args {
-                        opts.arg(arg);
-                    }
-                    db = opts.open(&id0_path);
-                }
+        if db.is_err()
+            && let Some(id0_path) = unpacked_id0_path(db_path_to_open)
+            && id0_path.exists()
+        {
+            info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
+            opened_path = id0_path.clone();
+            let mut opts = IDBOpenOptions::new();
+            opts.auto_analyse(false).save(true);
+            for arg in &init_args {
+                opts.arg(arg);
             }
+            db = opts.open(&id0_path);
         }
         (db, opened_path)
     } else {
@@ -412,22 +424,23 @@ pub fn handle_open(
                 }
             }
         }
-    } else if !is_idb && should_load_dsym {
-        if let Some(path) = dsym_path.as_ref() {
-            emit_progress(
-                progress_tx.as_ref(),
-                "loading_debug_info",
-                3.0,
-                Some(OPEN_IDB_PROGRESS_TOTAL),
-                "Loading sibling dSYM debug information",
-            );
-            ensure_not_cancelled(cancel.as_ref())?;
-            info!(path = %path.display(), "Loading dSYM debug info");
-            match db.load_debug_info(path, false) {
-                Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
-                Ok(false) => warn!(path = %path.display(), "dSYM debug info load failed"),
-                Err(e) => warn!(path = %path.display(), error = %e, "dSYM debug info load error"),
-            }
+    } else if !is_idb
+        && should_load_dsym
+        && let Some(path) = dsym_path.as_ref()
+    {
+        emit_progress(
+            progress_tx.as_ref(),
+            "loading_debug_info",
+            3.0,
+            Some(OPEN_IDB_PROGRESS_TOTAL),
+            "Loading sibling dSYM debug information",
+        );
+        ensure_not_cancelled(cancel.as_ref())?;
+        info!(path = %path.display(), "Loading dSYM debug info");
+        match db.load_debug_info(path, false) {
+            Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
+            Ok(false) => warn!(path = %path.display(), "dSYM debug info load failed"),
+            Err(e) => warn!(path = %path.display(), error = %e, "dSYM debug info load error"),
         }
     }
     ensure_not_cancelled(cancel.as_ref())?;
@@ -488,7 +501,8 @@ mod tests {
 
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
-        has_ida_database_extension, idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
+        existing_idb_for_raw_open, has_ida_database_extension, idb_path_for_raw_binary,
+        init_database_args, non_empty_trimmed,
     };
 
     #[test]
@@ -574,6 +588,31 @@ mod tests {
 
         fs::write(&generated, b"generated idb").expect("write generated idb");
         assert_eq!(existing_idb_for_raw_binary(&raw), Some(generated));
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn explicit_idb_out_does_not_reuse_default_generated_database() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ida-mcp-test-{unique}"));
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("dyld_shared_cache_arm64e");
+        let generated = dir.join("dyld_shared_cache_arm64e.i64");
+        let explicit = dir.join("explicit-output.i64");
+
+        fs::write(&raw, b"raw").expect("write raw");
+        fs::write(&generated, b"default generated idb").expect("write generated idb");
+
+        assert_eq!(existing_idb_for_raw_open(&raw, Some(&explicit)), None);
+
+        fs::write(&explicit, b"explicit generated idb").expect("write explicit idb");
+        assert_eq!(
+            existing_idb_for_raw_open(&raw, Some(&explicit)),
+            Some(explicit)
+        );
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 

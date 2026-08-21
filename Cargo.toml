@@ -1,7 +1,8 @@
 [package]
 name = "ida-mcp"
-version = "9.3.24"
-edition = "2021"
+version = "9.4.2"
+edition = "2024"
+rust-version = "1.89"
 description = "Headless IDA Pro CLI Tool for reverse engineering"
 license = "MIT"
 repository = "https://github.com/ltlly/ida-rs-cli"
@@ -19,8 +20,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
-rmcp = { version = "1.7", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
+idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0" }
+rmcp = { version = "3.1", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "request-state", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -41,11 +42,14 @@ tower-service = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
 [build-dependencies]
 cc = "1"
-idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1", package = "idalib-build" }
-
-# [patch."https://github.com/blacktop/idalib.git"]
-# idalib = { path = "../idalib/idalib" }
-# idalib-build = { path = "../idalib/idalib-build" }
-# idalib-sys = { path = "../idalib/idalib-sys" }
+idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0", package = "idalib-build" }

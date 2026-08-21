@@ -1,11 +1,10 @@
 //! dyld_shared_cache (DSC) support utilities.
 //!
-//! Builds the IDA file type selector string and the IDAPython script
-//! that drives the dscu plugin to load individual modules from a DSC.
+//! Builds IDA file type selector strings and legacy IDAPython scripts for
+//! dyld_shared_cache loading.
 //!
-//! idalib's headless mode cannot handle the DSC loader's module
-//! selection — `init_database()` calls `exit(1)`. So DSC loading is
-//! a two-phase process:
+//! IDA 9.4 exposes native `dscu_svc_t` APIs that ida-mcp calls directly
+//! through `idalib::dscu`. Older IDA builds still need a two-phase flow:
 //!   1. Run `idat -a- -A -S<script> -T<loader> -o<out.i64> <dsc>`
 //!      to create the database via IDA's autonomous CLI mode.
 //!   2. Open the resulting `.i64` with idalib for interactive analysis.
@@ -27,7 +26,7 @@ pub(crate) fn escape_python_string(s: &str) -> String {
 
 /// Build the IDA `-T` file type string for a dyld_shared_cache.
 ///
-/// IDA 9.3 offers two DSC loader modes:
+/// IDA 9.x offers two DSC loader modes:
 /// - `"(select module(s))"` — loads specific modules (was `"(single module)"` in IDA 8)
 /// - `"(complete image)"` — loads the entire DSC
 ///
@@ -127,24 +126,111 @@ pub fn idat_dsc_args(
     args
 }
 
+fn dscu_python_helpers() -> &'static str {
+    r#"
+def run_plugin_checked(name, arg, context, strict_nonzero=False):
+    def plugin_failed():
+        raise RuntimeError(f"{name} plugin failed during {context} (return={rc!r})")
+
+    rc = load_and_run_plugin(name, arg)
+    if rc is None:
+        plugin_failed()
+    if strict_nonzero and (rc is False or (isinstance(rc, int) and rc <= 0)):
+        plugin_failed()
+    if isinstance(rc, int) and rc < 0:
+        plugin_failed()
+    return rc
+
+def legacy_dscu_load_module(module):
+    node = idaapi.netnode()
+    node.create("$ dscu")
+    node.supset(2, module)
+    run_plugin_checked("dscu", 1, f"loading module {module}", True)
+
+def modern_dscu_service():
+    try:
+        import ida_dscu
+    except ImportError:
+        return None, None
+
+    svc = ida_dscu.get_dscu_svc()
+    if svc is None:
+        return ida_dscu, None
+    return ida_dscu, svc
+
+def dscu_load_module(module):
+    ida_dscu, svc = modern_dscu_service()
+    if svc is None:
+        legacy_dscu_load_module(module)
+        return "legacy"
+
+    image_index = svc.get_image_index(module)
+    if image_index < 0:
+        raise RuntimeError(f"DSC image not found: {module}")
+    if svc.is_image_loaded(image_index):
+        print(f"[ida-mcp] module already loaded: {module}")
+        return "ida_dscu"
+    if not svc.load_image(image_index):
+        raise RuntimeError(f"ida_dscu failed to load module: {module}")
+    return "ida_dscu"
+
+def legacy_dscu_load_region(ea):
+    node = idaapi.netnode()
+    node.create("$ dscu")
+    node.altset(3, ea)
+    run_plugin_checked("dscu", 2, f"loading region {ea:#x}", True)
+
+def modern_dscu_load_region(ida_dscu, svc, ea):
+    info = svc.locate_address(ea)
+    region = info.region
+    if region.type == ida_dscu.rt_invalid:
+        raise RuntimeError(f"DSC address is not mapped: {ea:#x}")
+
+    if region.type == ida_dscu.rt_image_entity:
+        ok = svc.load_image(region.image_index)
+    elif region.type == ida_dscu.rt_island:
+        island = getattr(region, "branch_island_number", region.image_index)
+        ok = svc.load_island(island)
+    elif region.type == ida_dscu.rt_mapping:
+        ok = svc.load_branch_mapping(region.start)
+    elif region.type == ida_dscu.rt_got:
+        ok = svc.load_got(region.start)
+    elif region.type == ida_dscu.rt_unknown:
+        ok = svc.load_unknown_region(region.start)
+    elif region.type == ida_dscu.rt_cache_data:
+        ok = svc.load_cache_data(region.start)
+    else:
+        raise RuntimeError(f"DSC region type is not loadable: {region.type}")
+
+    if not ok:
+        raise RuntimeError(f"ida_dscu failed to load region at {ea:#x}")
+
+def dscu_load_region(ea):
+    ida_dscu, svc = modern_dscu_service()
+    if svc is None:
+        legacy_dscu_load_region(ea)
+        return "legacy"
+
+    modern_dscu_load_region(ida_dscu, svc, ea)
+    return "ida_dscu"
+"#
+}
+
 /// Build the IDAPython script that loads modules from a DSC and
 /// runs ObjC analysis.
 ///
-/// The script uses `dscu_load_module` to communicate with the dscu
-/// plugin via IDA's netnode API, then runs ObjC type, block, and
-/// auto-analysis passes.
+/// IDA 9.4 exposes `ida_dscu.get_dscu_svc()` for direct module/region
+/// loading from an already-open DSC database. Older IDA builds fall back to
+/// the legacy `$ dscu` netnode protocol used by the dscu plugin.
 pub fn dsc_load_script(module: &str, frameworks: &[String]) -> String {
-    let mut script = String::from(
+    let helpers = dscu_python_helpers();
+    let mut script = format!(
         "\
-import idaapi
-from idc import *
+	import idaapi
+	from idc import *
 
-def dscu_load_module(module):
-    node = idaapi.netnode()
-    node.create(\"$ dscu\")
-    node.supset(2, module)
-    load_and_run_plugin(\"dscu\", 1)
-",
+	{helpers}
+	"
     );
 
     let escaped_module = escape_python_string(module);
@@ -152,8 +238,9 @@ def dscu_load_module(module):
     // Load primary module
     script.push_str(&format!(
         "\n# Load primary module\n\
-         print(\"[ida-mcp] loading module: {escaped_module}\")\n\
-         dscu_load_module(\"{escaped_module}\")\n"
+	         print(\"[ida-mcp] loading module: {escaped_module}\")\n\
+	         dsc_backend = dscu_load_module(\"{escaped_module}\")\n\
+	         print(f\"[ida-mcp] dsc backend: {{dsc_backend}}\")\n"
     ));
 
     // Load additional frameworks
@@ -161,7 +248,7 @@ def dscu_load_module(module):
         let escaped_fw = escape_python_string(fw);
         script.push_str(&format!(
             "\nprint(\"[ida-mcp] loading framework: {escaped_fw}\")\n\
-             dscu_load_module(\"{escaped_fw}\")\n"
+	             dscu_load_module(\"{escaped_fw}\")\n"
         ));
     }
 
@@ -190,47 +277,25 @@ print(\"[ida-mcp] DSC module loading complete\")
     script
 }
 
-/// Build an IDAPython script that incrementally loads a single dylib
-/// into an already-open DSC database via the dscu plugin.
+/// Build a legacy IDAPython script that incrementally loads a single dylib
+/// into an already-open DSC database.
 ///
 /// Unlike [`dsc_load_script`], this script intentionally omits the
 /// global `auto_mark_range(0, BADADDR, AU_FINAL)` + `auto_wait()` pass
 /// so that incremental adds stay fast and avoid multi-minute timeouts.
-fn run_plugin_checked_python() -> &'static str {
-    r#"
-def run_plugin_checked(name, arg, context, strict_nonzero=False):
-    def plugin_failed():
-        raise RuntimeError(f"{name} plugin failed during {context} (return={rc!r})")
-
-    rc = load_and_run_plugin(name, arg)
-    if rc is None:
-        plugin_failed()
-    if strict_nonzero and (rc is False or (isinstance(rc, int) and rc <= 0)):
-        plugin_failed()
-    if isinstance(rc, int) and rc < 0:
-        plugin_failed()
-    return rc
-"#
-}
-
 pub fn dsc_add_dylib_script(module: &str) -> String {
     let escaped = escape_python_string(module);
-    let run_plugin_checked = run_plugin_checked_python();
+    let helpers = dscu_python_helpers();
     format!(
         "\
-import idaapi
-from idc import *
+	import idaapi
+	from idc import *
 
-{run_plugin_checked}
+	{helpers}
 
-def dscu_load_module(module):
-    node = idaapi.netnode()
-    node.create(\"$ dscu\")
-    node.supset(2, module)
-    run_plugin_checked(\"dscu\", 1, f\"loading module {{module}}\", True)
-
-print(\"[ida-mcp] loading additional dylib: {escaped}\")
-dscu_load_module(\"{escaped}\")
+	print(\"[ida-mcp] loading additional dylib: {escaped}\")
+	dsc_backend = dscu_load_module(\"{escaped}\")
+	print(f\"[ida-mcp] dsc backend: {{dsc_backend}}\")
 
 # ObjC type analysis (lightweight, no full auto-analysis)
 print(\"[ida-mcp] analyzing objc types\")
@@ -243,31 +308,26 @@ print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
     )
 }
 
-/// Build an IDAPython script that incrementally loads a single address
-/// region from an already-open DSC database via the dscu plugin.
+/// Build a legacy IDAPython script that incrementally loads a single address
+/// region from an already-open DSC database.
 ///
 /// This is useful for loading data/GOT/stub regions on-demand when an
 /// analysis session needs additional non-code areas from the dyld cache.
 pub fn dsc_add_region_script(ea: u64) -> String {
     let ea_hex = format!("0x{ea:x}");
-    let run_plugin_checked = run_plugin_checked_python();
+    let helpers = dscu_python_helpers();
     format!(
         "\
-import idaapi
-from idc import *
+	import idaapi
+	from idc import *
 
-{run_plugin_checked}
+	{helpers}
 
-def dscu_load_region(ea):
-    node = idaapi.netnode()
-    node.create(\"$ dscu\")
-    node.altset(3, ea)
-    run_plugin_checked(\"dscu\", 2, \"loading region {ea_hex}\", True)
-
-print(\"[ida-mcp] loading DSC region: {ea_hex}\")
-dscu_load_region({ea})
-print(\"[ida-mcp] dsc_add_region complete for: {ea_hex}\")
-"
+	print(\"[ida-mcp] loading region {ea_hex}\")
+	dsc_backend = dscu_load_region({ea})
+	print(f\"[ida-mcp] dsc backend: {{dsc_backend}}\")
+	print(\"[ida-mcp] dsc_add_region complete for: {ea_hex}\")
+	"
     )
 }
 

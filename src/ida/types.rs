@@ -14,6 +14,31 @@ pub struct DbInfo {
     pub analysis_status: AnalysisStatus,
 }
 
+/// Opaque identity for one database-open lifetime within a worker backend.
+///
+/// A background task captures this at open and passes it back for every later
+/// operation on that database, so a close/reopen cannot silently redirect the
+/// task's remaining work onto whatever database is current. It scopes both
+/// cleanup (a stale task may close the database it opened, never a newer one)
+/// and post-open work (a stale task must not read or mutate a newer one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseGeneration(pub(crate) u64);
+
+/// Internal open result that carries the database lifetime identity without
+/// exposing it in the public MCP tool response.
+#[derive(Debug, Clone)]
+pub struct OpenedDatabase {
+    pub(crate) info: DbInfo,
+    pub(crate) generation: DatabaseGeneration,
+}
+
+/// Result of closing only when an expected database lifetime is still active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalCloseResult {
+    Closed,
+    NotCurrent,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DebugInfoLoad {
     pub path: String,
@@ -28,6 +53,30 @@ pub struct AnalysisStatus {
     pub auto_state: String,
     pub auto_state_id: i32,
     pub analysis_running: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscImageInfo {
+    pub index: i32,
+    pub name: String,
+    pub file_name: String,
+    pub address: String,
+    pub address_value: u64,
+    pub total_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_index: Option<u64>,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscRegionInfo {
+    pub start: String,
+    pub start_value: u64,
+    pub size: u64,
+    pub kind: String,
+    pub image_index: i32,
+    pub name: String,
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -248,6 +297,20 @@ pub struct XRefInfo {
     pub to: String,
     pub r#type: String,
     pub is_code: bool,
+}
+
+/// Paginated cross-reference listing.
+///
+/// `truncated` is true when more references exist beyond `limit`; in that case
+/// `next_offset` carries the offset to pass on the next call to page through
+/// the remaining references. High-frequency targets can have enormous xref
+/// counts, so enumeration is always bounded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XRefListResult {
+    pub xrefs: Vec<XRefInfo>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 /// Declared type result

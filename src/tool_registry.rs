@@ -164,20 +164,23 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     (optionally specify debug_info_path). \
                     The database must be opened before using any other analysis tools. \
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
-                    In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
+                    In HTTP/SSE mode, keep the close_token returned by open_idb for sessionless MCP 2026 or cross-session close requests; the owning legacy session can close directly. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
                     Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
         example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
         default: true,
-        keywords: &["open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe"],
+        keywords: &[
+            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",
+        ],
     },
     ToolInfo {
         name: "open_dsc",
         category: ToolCategory::Core,
         short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more",
         full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
-                    Handles DSC-specific loader selection and dscu plugin orchestration automatically. \
-                    After opening, runs ObjC type and block analysis on the loaded module. \
+                    A previously generated .i64 for the same DSC is reopened directly, preserving prior analysis. \
+                    Otherwise IDA 9.4 opens the DSC header directly and loads images through IDA's native dscu service; \
+                    older IDA builds keep the legacy idat background flow when a generated .i64 is needed. \
                     Use this instead of open_idb when working with dyld_shared_cache files. \
                     Optionally load additional frameworks to resolve cross-module references. \
                     To load more code modules after the initial open, call dsc_add_dylib. \
@@ -192,16 +195,25 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "dsc_add_dylib",
         category: ToolCategory::Core,
-        short_desc: "Load an additional dylib into an open DSC database (light analysis only)",
+        short_desc: "Load an additional dylib into an open DSC database",
         full_desc: "Incrementally load a single dylib into a database previously opened via open_dsc. \
-                    Uses the dscu plugin to add the module, then runs ObjC type analysis. \
+                    Uses IDA's native dscu service to add the module. \
                     Skips full auto-analysis to keep the operation fast. \
                     Call once per module; then check analysis_status. \
                     If auto_is_ok is false, run analyze_funcs before relying on xrefs/decompile. \
                     Requires: database opened via open_dsc.",
         example: r#"{"module": "/System/Library/Frameworks/Foundation.framework/Foundation", "timeout_secs": 300}"#,
         default: false,
-        keywords: &["dsc", "dyld", "dylib", "module", "load", "add", "framework", "cache"],
+        keywords: &[
+            "dsc",
+            "dyld",
+            "dylib",
+            "module",
+            "load",
+            "add",
+            "framework",
+            "cache",
+        ],
     },
     ToolInfo {
         name: "dsc_add_region",
@@ -209,22 +221,14 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         short_desc: "Load a DSC memory region by address (data/GOT/stubs)",
         full_desc: "Incrementally load a specific region from the currently open DSC database by address. \
                     Accepts exactly one address per call. \
-                    Uses the dscu plugin region mode for on-demand data/GOT/stub loading. \
+                    Uses IDA's native dscu service for on-demand data/GOT/stub loading. \
                     This does not force full auto-analysis; check analysis_status and run analyze_funcs \
                     when deeper cross-reference/decompile fidelity is required after loading. \
                     Requires: database opened via open_dsc.",
         example: r#"{"address": "0x180116000", "timeout_secs": 300}"#,
         default: false,
         keywords: &[
-            "dsc",
-            "dyld",
-            "region",
-            "memory",
-            "address",
-            "got",
-            "stubs",
-            "data",
-            "load",
+            "dsc", "dyld", "region", "memory", "address", "got", "stubs", "data", "load",
         ],
     },
     ToolInfo {
@@ -255,7 +259,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         full_desc: "Close the currently open IDA database, releasing resources. \
                     Call this when done with analysis or before opening a different database. \
                     In multi-client servers, coordinate before closing to avoid interrupting others. \
-                    In HTTP/SSE mode, provide the close_token returned by open_idb.",
+                    In HTTP/SSE mode, provide the close_token returned by open_idb unless the request is in the owning legacy session.",
         example: r#"{"close_token": "token-from-open-idb"}"#,
         default: true,
         keywords: &["close", "unload", "database"],
@@ -291,7 +295,15 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Use this after timeouts, cancellations, or failures to inspect the last known phase.",
         example: r#"{"limit": 10}"#,
         default: false,
-        keywords: &["recent", "operations", "history", "progress", "timeout", "cancel", "observability"],
+        keywords: &[
+            "recent",
+            "operations",
+            "history",
+            "progress",
+            "timeout",
+            "cancel",
+            "observability",
+        ],
     },
     ToolInfo {
         name: "task_status",
@@ -316,7 +328,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: true,
         keywords: &["info", "metadata", "summary", "database", "binary"],
     },
-
     // === FUNCTIONS ===
     ToolInfo {
         name: "list_functions",
@@ -327,7 +338,14 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Use filter parameter to search by substring in function name.",
         example: r#"{"offset": 0, "limit": 100, "filter": "init"}"#,
         default: false,
-        keywords: &["functions", "list", "enumerate", "find", "filter", "subroutines"],
+        keywords: &[
+            "functions",
+            "list",
+            "enumerate",
+            "find",
+            "filter",
+            "subroutines",
+        ],
     },
     ToolInfo {
         name: "list_funcs",
@@ -381,9 +399,15 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     for completion, records phase transitions in recent_operations, and respects timeout_secs.",
         example: r#"{"background": true}"#,
         default: false,
-        keywords: &["analyze", "functions", "analysis", "auto", "background", "task"],
+        keywords: &[
+            "analyze",
+            "functions",
+            "analysis",
+            "auto",
+            "background",
+            "task",
+        ],
     },
-
     // === DISASSEMBLY ===
     ToolInfo {
         name: "disasm",
@@ -416,7 +440,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["disassemble", "function", "address", "pc", "lr"],
     },
-
     // === DECOMPILE ===
     ToolInfo {
         name: "decompile",
@@ -439,7 +462,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["pseudocode", "decompile", "block", "range", "statement"],
     },
-
     // === XREFS ===
     ToolInfo {
         name: "xrefs_to",
@@ -483,7 +505,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["xrefs", "matrix", "relationships", "graph"],
     },
-
     // === CONTROL FLOW ===
     ToolInfo {
         name: "basic_blocks",
@@ -535,7 +556,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["paths", "route", "flow", "between", "reach"],
     },
-
     // === MEMORY ===
     ToolInfo {
         name: "get_bytes",
@@ -612,7 +632,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["int", "convert", "hex", "decimal", "ascii"],
     },
-
     // === SEARCH ===
     ToolInfo {
         name: "find_bytes",
@@ -685,7 +704,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["find", "operands", "instructions", "pattern"],
     },
-
     // === METADATA ===
     ToolInfo {
         name: "segments",
@@ -744,6 +762,29 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["entry", "start", "main", "entrypoint"],
     },
     ToolInfo {
+        name: "lumina_lookup",
+        category: ToolCategory::Metadata,
+        short_desc: "Look up Lumina metadata for a function",
+        full_desc: "Query the configured Lumina server for a function signature and metadata \
+                    without changing the database. Requires explicit server startup with \
+                    --allow-lumina or IDA_MCP_ALLOW_LUMINA=true.",
+        example: r#"{"target_name": "sub_1000"}"#,
+        default: false,
+        keywords: &["lumina", "signature", "metadata", "lookup", "match"],
+    },
+    ToolInfo {
+        name: "lumina_apply",
+        category: ToolCategory::Editing,
+        short_desc: "Apply Lumina metadata to a function",
+        full_desc: "Pull metadata from the configured Lumina server and apply it to one function. \
+                    Uses IDA's upgrade policy by default; force=true may replace existing names, \
+                    types, or comments. Requires explicit server startup with --allow-lumina or \
+                    IDA_MCP_ALLOW_LUMINA=true.",
+        example: r#"{"address": "0x1000", "force": false}"#,
+        default: false,
+        keywords: &["lumina", "signature", "metadata", "apply", "rename", "type"],
+    },
+    ToolInfo {
         name: "list_globals",
         category: ToolCategory::Metadata,
         short_desc: "List global variables",
@@ -752,7 +793,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["globals", "variables", "data", "symbols"],
     },
-
     // === TYPES / STRUCTS ===
     ToolInfo {
         name: "local_types",
@@ -866,7 +906,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["struct", "search", "types"],
     },
-
     // === EDITING / PATCHING ===
     ToolInfo {
         name: "set_comments",
@@ -910,7 +949,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["rename", "symbol", "edit"],
     },
-
     // === SCRIPTING ===
     ToolInfo {
         name: "run_script",
@@ -926,7 +964,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     API reference: https://python.docs.hex-rays.com",
         example: r#"{"code": "import idautils\nfor f in idautils.Functions():\n    print(hex(f))"}"#,
         default: false,
-        keywords: &["script", "python", "execute", "eval", "idapython", "run", "code", "file"],
+        keywords: &[
+            "script",
+            "python",
+            "execute",
+            "eval",
+            "idapython",
+            "run",
+            "code",
+            "file",
+        ],
     },
 ];
 

@@ -204,10 +204,26 @@ send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 list_resp=$(wait_response 2 10)
 names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
 echo "$names" | grep -q '^open_idb$' || { echo "FAIL: read-only env should keep open_idb"; exit 1; }
+echo "$names" | grep -q '^lumina_lookup$' || { echo "FAIL: read-only env should keep lumina_lookup"; exit 1; }
 if echo "$names" | grep -q '^run_script$'; then
   echo "FAIL: IDA_MCP_READ_ONLY=1 should drop run_script" >&2
   exit 1
 fi
+if echo "$names" | grep -q '^lumina_apply$'; then
+  echo "FAIL: IDA_MCP_READ_ONLY=1 should drop lumina_apply" >&2
+  exit 1
+fi
+
+# First request that reaches the IDA worker loop, so it pays the deferred
+# idalib::init_library() cost on the main thread — allow a generous timeout.
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lumina_lookup","arguments":{"address":"0x1000"}}}'
+lumina_resp=$(wait_response 3 90)
+echo "$lumina_resp" | jq -e \
+  '.result.isError == true and (.result.content[0].text | test("Lumina access is disabled"))' \
+  >/dev/null || {
+  echo "FAIL: default lumina_lookup should require explicit opt-in; got: $lumina_resp" >&2
+  exit 1
+}
 
 IDA_MCP_READ_ONLY=0 start_server
 initialize
@@ -215,7 +231,7 @@ send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 list_resp=$(wait_response 2 10)
 names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
 echo "$names" | grep -q '^run_script$' || { echo "FAIL: IDA_MCP_READ_ONLY=0 should leave run_script enabled"; exit 1; }
-echo "   ✓ IDA_MCP_READ_ONLY accepts 1/0"
+echo "   ✓ IDA_MCP_READ_ONLY accepts 1/0 and preserves the Lumina privacy gate"
 
 # --- Phase C: flags override env vars ---
 # Env says 'core' (12 tools); flag forces 'decompile' (smaller set).
