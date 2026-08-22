@@ -225,6 +225,16 @@ pub enum DaemonCommand {
     Stop,
     /// Show daemon status and loaded target count
     Status,
+    /// Internal: run a per-target worker subprocess (spawned by the daemon).
+    #[command(hide = true)]
+    Worker {
+        /// This worker's private socket path
+        #[arg(long)]
+        sock: std::path::PathBuf,
+        /// Router-assigned target ID (e.g. "t3")
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -236,7 +246,9 @@ pub struct TargetArgs {
 /// Target (binary/IDB) management within the daemon.
 #[derive(Subcommand)]
 pub enum TargetCommand {
-    /// Load a new binary or IDB file into the daemon for analysis
+    /// Load a new binary or IDB file into the daemon for analysis.
+    /// Each target is served by its own worker process. A loaded target only
+    /// becomes active if no other target is active; use `target switch`.
     Load {
         /// Path to binary or .i64/.idb database file
         #[arg(long, short = 'f')]
@@ -851,19 +863,28 @@ fn run_daemon_command(cmd: &DaemonCommand) -> anyhow::Result<()> {
     match cmd {
         DaemonCommand::Start { background } => {
             if *background {
-                eprintln!("Background mode not yet implemented. Running in foreground...");
+                start_daemon_background()
+            } else {
+                daemon::run_router()
             }
-            daemon::run_daemon(true)?;
         }
         DaemonCommand::Stop => {
-            let response = send_daemon_request("shutdown", json!({}), None)?;
-            if response.ok {
-                eprintln!("Daemon stopped.");
-            } else {
-                eprintln!(
+            let response = send_daemon_request(
+                "shutdown",
+                json!({}),
+                None,
+                std::time::Duration::from_secs(crate::daemon::CLIENT_STOP_TIMEOUT_SECS),
+            );
+            match response {
+                Ok(resp) if resp.ok => {
+                    eprintln!("Daemon stopped.");
+                    Ok(())
+                }
+                Ok(resp) => anyhow::bail!(
                     "Failed to stop daemon: {}",
-                    response.error.unwrap_or_default()
-                );
+                    resp.error.unwrap_or_default()
+                ),
+                Err(e) => anyhow::bail!("Failed to stop daemon: {}", e),
             }
         }
         DaemonCommand::Status => {
@@ -873,26 +894,40 @@ fn run_daemon_command(cmd: &DaemonCommand) -> anyhow::Result<()> {
                 eprintln!("Daemon is not running (no socket found).");
                 return Ok(());
             }
-            if reg_path.exists() {
-                let contents = std::fs::read_to_string(&reg_path)?;
-                let reg: serde_json::Value = serde_json::from_str(&contents)?;
-                eprintln!("Daemon is running:");
-                eprintln!(
-                    "  PID: {}",
-                    reg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0)
-                );
-                eprintln!(
-                    "  Socket: {}",
-                    reg.get("socket").and_then(|v| v.as_str()).unwrap_or("?")
-                );
-                eprintln!(
-                    "  Version: {}",
-                    reg.get("version").and_then(|v| v.as_str()).unwrap_or("?")
-                );
+            // Best-effort registry read; a corrupt file must not break status.
+            let registry = std::fs::read_to_string(&reg_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+            if registry.is_none() && reg_path.exists() {
+                eprintln!("  Warning: could not parse registry file {}", reg_path.display());
             }
-            // Ping to verify liveness
-            match send_daemon_request("ping", json!({}), None) {
+            // Ping with a short timeout to verify liveness. Only claim
+            // "running" once the daemon actually answers.
+            match send_daemon_request(
+                "ping",
+                json!({}),
+                None,
+                std::time::Duration::from_secs(crate::daemon::CLIENT_STATUS_TIMEOUT_SECS),
+            ) {
                 Ok(resp) if resp.ok => {
+                    eprintln!("Daemon is running:");
+                    if let Some(reg) = &registry {
+                        let pid = reg.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let alive = if pid > 0 && crate::daemon::pid_alive(pid as u32) {
+                            "alive"
+                        } else {
+                            "not running?"
+                        };
+                        eprintln!("  PID: {} ({})", pid, alive);
+                        eprintln!(
+                            "  Socket: {}",
+                            reg.get("socket").and_then(|v| v.as_str()).unwrap_or("?")
+                        );
+                        eprintln!(
+                            "  Version: {}",
+                            reg.get("version").and_then(|v| v.as_str()).unwrap_or("?")
+                        );
+                    }
                     if let Some(result) = &resp.result {
                         let targets =
                             result.get("targets").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -904,9 +939,98 @@ fn run_daemon_command(cmd: &DaemonCommand) -> anyhow::Result<()> {
                     eprintln!("  Status: socket exists but daemon not responding");
                 }
             }
+            Ok(())
+        }
+        DaemonCommand::Worker { sock, id } => daemon::run_worker(sock.clone(), id),
+    }
+}
+
+/// Start the daemon detached: re-exec ourselves in a new session with output
+/// appended to the daemon log, then wait for the socket to answer pings.
+fn start_daemon_background() -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let sock_path = crate::daemon::socket_path();
+    if sock_path.exists()
+        && send_daemon_request(
+            "ping",
+            json!({}),
+            None,
+            std::time::Duration::from_secs(crate::daemon::CLIENT_STATUS_TIMEOUT_SECS),
+        )
+        .map(|r| r.ok)
+        .unwrap_or(false)
+    {
+        anyhow::bail!("Daemon is already running. Use 'ida-rs-cli daemon stop' first.");
+    }
+
+    let log_path = crate::daemon::log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg("start")
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
+    // Detach into a new session so the daemon survives terminal hangup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
-    Ok(())
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Wait for the daemon to come up (socket + ping), watching for early exit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if sock_path.exists()
+            && send_daemon_request(
+                "ping",
+                json!({}),
+                None,
+                std::time::Duration::from_secs(crate::daemon::CLIENT_STATUS_TIMEOUT_SECS),
+            )
+            .map(|r| r.ok)
+            .unwrap_or(false)
+        {
+            eprintln!("Daemon started in background (pid {})", pid);
+            eprintln!("  Socket: {}", sock_path.display());
+            eprintln!("  Log: {}", log_path.display());
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: String = tail.lines().rev().take(20).collect::<Vec<_>>().join("\n");
+            let _ = writeln!(std::io::stderr(), "Daemon exited during startup: {}", status);
+            if !tail.is_empty() {
+                let _ = writeln!(std::io::stderr(), "Last log lines:\n{}", tail);
+            }
+            anyhow::bail!("Background daemon failed to start (see {})", log_path.display());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Daemon did not become ready within 15s (see {})",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -927,7 +1051,7 @@ fn run_target_command(cmd: &TargetCommand) -> anyhow::Result<()> {
             if let Some(out) = idb_out {
                 params["idb_out"] = json!(out);
             }
-            let response = send_daemon_request("target.load", params, None)?;
+            let response = send_daemon_request("target.load", params, None, client_timeout())?;
             if response.ok {
                 output_json(&response.result)?;
             } else {
@@ -938,7 +1062,7 @@ fn run_target_command(cmd: &TargetCommand) -> anyhow::Result<()> {
             }
         }
         TargetCommand::List => {
-            let response = send_daemon_request("target.list", json!({}), None)?;
+            let response = send_daemon_request("target.list", json!({}), None, client_timeout())?;
             if response.ok {
                 output_json(&response.result)?;
             } else {
@@ -949,9 +1073,15 @@ fn run_target_command(cmd: &TargetCommand) -> anyhow::Result<()> {
             }
         }
         TargetCommand::Close { id } => {
-            let response = send_daemon_request("target.close", json!({"id": id}), None)?;
+            let response = send_daemon_request("target.close", json!({"id": id}), None, client_timeout())?;
             if response.ok {
-                eprintln!("Target '{}' closed.", id);
+                let closed = response
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.get("closed"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id);
+                eprintln!("Target '{}' closed.", closed);
             } else {
                 anyhow::bail!(
                     "{}",
@@ -960,9 +1090,15 @@ fn run_target_command(cmd: &TargetCommand) -> anyhow::Result<()> {
             }
         }
         TargetCommand::Switch { id } => {
-            let response = send_daemon_request("target.switch", json!({"id": id}), None)?;
+            let response = send_daemon_request("target.switch", json!({"id": id}), None, client_timeout())?;
             if response.ok {
-                eprintln!("Switched to target '{}'.", id);
+                let active = response
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.get("active"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id);
+                eprintln!("Switched to target '{}'.", active);
             } else {
                 anyhow::bail!(
                     "{}",
@@ -980,7 +1116,7 @@ fn run_target_command(cmd: &TargetCommand) -> anyhow::Result<()> {
 
 fn run_via_daemon(cli: &Cli) -> anyhow::Result<()> {
     let (op, params) = cli_command_to_request(&cli.command)?;
-    let response = send_daemon_request(&op, params, cli.target.as_deref())?;
+    let response = send_daemon_request(&op, params, cli.target.as_deref(), client_timeout())?;
     if response.ok {
         if let Some(result) = &response.result {
             let spill_result = crate::spill::maybe_spill(result, &op, cli.spill_threshold)?;
@@ -1000,10 +1136,14 @@ fn run_via_daemon(cli: &Cli) -> anyhow::Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Send a JSON-line request to the daemon via Unix socket and read the response.
+///
+/// The read is bounded by `timeout` so a wedged daemon cannot hang the CLI
+/// forever. Use `client_timeout()` for regular analysis commands.
 fn send_daemon_request(
     op: &str,
     params: serde_json::Value,
     target: Option<&str>,
+    timeout: std::time::Duration,
 ) -> anyhow::Result<crate::daemon::Response> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
@@ -1017,6 +1157,9 @@ fn send_daemon_request(
 
     let mut stream = UnixStream::connect(&sock_path)
         .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {}", e))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| anyhow::anyhow!("Failed to set socket timeout: {}", e))?;
 
     let request = crate::daemon::Request {
         id: make_request_id(),
@@ -1032,12 +1175,34 @@ fn send_daemon_request(
 
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
-    reader.read_line(&mut response_line)?;
+    reader.read_line(&mut response_line).map_err(|e| {
+        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+            anyhow::anyhow!(
+                "Daemon did not respond within {}s (op '{}'). It may be busy or wedged; \
+                 check 'ida-rs-cli daemon status'.",
+                timeout.as_secs(),
+                op
+            )
+        } else {
+            anyhow::anyhow!("Failed to read daemon response: {}", e)
+        }
+    })?;
 
     let response: crate::daemon::Response = serde_json::from_str(&response_line)
         .map_err(|e| anyhow::anyhow!("Invalid daemon response: {}", e))?;
 
     Ok(response)
+}
+
+/// Default client-side timeout for analysis commands.
+/// Overridable via IDA_CLI_TIMEOUT_SECS for very large binaries.
+fn client_timeout() -> std::time::Duration {
+    let secs = std::env::var("IDA_CLI_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(crate::daemon::CLIENT_DEFAULT_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Generate a unique request ID.

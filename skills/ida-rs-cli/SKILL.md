@@ -9,8 +9,13 @@ Use this skill when the user wants reverse-engineering work driven by the local 
 
 ## Architecture
 
-- **Daemon** — long-running process started via `ida-rs-cli daemon start`. Holds loaded binaries/IDBs in memory. Manages multiple targets concurrently.
+- **Daemon (router)** — long-running process started via `ida-rs-cli daemon start`. Owns the public Unix socket, tracks targets, and forwards requests. Holds no IDB itself.
+- **Worker subprocesses** — one per loaded target (`ida-rs-cli daemon worker`, spawned automatically). Each worker opens its IDB in its own process, because idalib permits only one open database per process. A stuck or slow analysis on one target never blocks the others or the daemon itself.
 - **CLI** — stateless client that sends JSON-line requests to the daemon over a Unix socket and prints JSON results to stdout.
+
+Notes:
+- Loading a target only makes it active when no target is active yet; use `target switch` to change the active target.
+- Requests have a client-side timeout (default 630s, env `IDA_CLI_TIMEOUT_SECS`) and a daemon-side per-operation timeout (default 600s, env `IDA_CLI_OP_TIMEOUT_SECS`).
 
 ## Workflow
 

@@ -39,6 +39,12 @@ pub struct TargetManager {
     next_id: u64,
 }
 
+impl Default for TargetManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TargetManager {
     pub fn new() -> Self {
         Self {
@@ -97,6 +103,15 @@ impl TargetManager {
 
         info!("Target loaded: {} ({}s)", target_info.filename, elapsed);
         Ok(target_info)
+    }
+
+    /// Seed the ID allocator so the next loaded target gets `id`
+    /// (e.g. "t3"). Used by per-target worker subprocesses so their single
+    /// target carries the router-assigned ID. Non-"t<N>" IDs are ignored.
+    pub fn seed_next_id(&mut self, id: &str) {
+        if let Some(n) = id.strip_prefix('t').and_then(|s| s.parse::<u64>().ok()) {
+            self.next_id = n;
+        }
     }
 
     /// Close and unload a target by ID.
@@ -188,13 +203,34 @@ impl TargetManager {
             .ok_or_else(|| format!("Target not found: {}", target_id))?;
         Ok(&mut record.idb)
     }
+
+    /// Test-only: insert a target record without opening a real IDB.
+    #[cfg(test)]
+    pub(crate) fn insert_dummy(&mut self, filename: &str, path: &str) -> String {
+        let id = format!("t{}", self.next_id);
+        self.next_id += 1;
+        let info = TargetInfo {
+            id: id.clone(),
+            path: path.to_string(),
+            filename: filename.to_string(),
+            file_type: String::new(),
+            processor: String::new(),
+            bits: 64,
+            function_count: 0,
+        };
+        self.targets.insert(id.clone(), TargetRecord { idb: None, info });
+        if self.active_id.is_none() {
+            self.active_id = Some(id.clone());
+        }
+        id
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn expand_path(path: &str) -> PathBuf {
+pub(crate) fn expand_path(path: &str) -> PathBuf {
     path.strip_prefix("~/")
         .and_then(|stripped| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(stripped)))
         .unwrap_or_else(|| PathBuf::from(path))
@@ -206,15 +242,32 @@ fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
     PathBuf::from(raw_idb)
 }
 
-fn open_idb(path: &Path, auto_analyse: bool, idb_out: Option<&str>) -> Result<IDB, String> {
+/// True when the path names an existing IDA database rather than a raw binary.
+pub fn is_idb_path(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
+    ext == "i64" || ext == "idb" || ext == "id0"
+}
 
-    if is_idb {
+/// Effective IDB output path for a load: `None` for existing-IDB inputs,
+/// otherwise the explicit `--idb-out` or `<file>.i64` next to the input.
+/// The router uses this to detect output-path conflicts before spawning a
+/// worker; `open_idb` uses it for the actual open.
+pub fn effective_idb_out(path: &Path, idb_out: Option<&str>) -> Option<PathBuf> {
+    if is_idb_path(path) {
+        return None;
+    }
+    Some(match idb_out {
+        Some(out) => expand_path(out),
+        None => idb_path_for_raw_binary(path),
+    })
+}
+
+fn open_idb(path: &Path, auto_analyse: bool, idb_out: Option<&str>) -> Result<IDB, String> {
+    if is_idb_path(path) {
         let mut opts = IDBOpenOptions::new();
         opts.auto_analyse(auto_analyse).save(true);
         opts.arg("-A");
@@ -222,16 +275,109 @@ fn open_idb(path: &Path, auto_analyse: bool, idb_out: Option<&str>) -> Result<ID
             .map_err(|e| format!("Failed to open IDB: {}: {}", path.display(), e))
     } else {
         let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(true);
-        let out_path = if let Some(out) = idb_out {
-            PathBuf::from(out)
-        } else {
-            idb_path_for_raw_binary(path)
-        };
+        opts.auto_analyse(auto_analyse);
+        // effective_idb_out returns Some for raw binaries
+        let out_path = effective_idb_out(path, idb_out)
+            .ok_or_else(|| "internal: raw binary without idb out path".to_string())?;
         opts.arg("-A");
         opts.idb(&out_path)
             .save(true)
             .open(path)
             .map_err(|e| format!("Failed to open binary: {}: {}", path.display(), e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_prefers_exact_id_then_substring() {
+        let mut mgr = TargetManager::new();
+        let t1 = mgr.insert_dummy("libalpha.so", "/tmp/libalpha.so");
+        let t2 = mgr.insert_dummy("beta.bin", "/work/beta.bin");
+
+        // Exact ID match wins.
+        assert_eq!(mgr.resolve(Some("t2")).as_deref(), Ok("t2"));
+        // Filename substring.
+        assert_eq!(mgr.resolve(Some("alpha")).as_deref(), Ok("t1"));
+        // Path substring.
+        assert_eq!(mgr.resolve(Some("/work")).as_deref(), Ok("t2"));
+        // None / "active" / "" resolve to the active target (first loaded).
+        assert_eq!(mgr.resolve(None).as_deref(), Ok(t1.as_str()));
+        assert_eq!(mgr.resolve(Some("active")).as_deref(), Ok(t1.as_str()));
+        assert_eq!(mgr.resolve(Some("")).as_deref(), Ok(t1.as_str()));
+        // No match is an error; a substring matching both is ambiguous.
+        assert!(mgr.resolve(Some("nope")).is_err());
+        assert_eq!(mgr.resolve(Some("tmp")).as_deref(), Ok(t1.as_str())); // only t1 has /tmp
+        assert!(mgr.resolve(Some("/")).is_err()); // both paths contain '/'
+        let _ = t2;
+    }
+
+    #[test]
+    fn resolve_ambiguous_selector_errors() {
+        let mut mgr = TargetManager::new();
+        mgr.insert_dummy("foo-a.so", "/x/foo-a.so");
+        mgr.insert_dummy("foo-b.so", "/x/foo-b.so");
+        let err = mgr.resolve(Some("foo")).unwrap_err();
+        assert!(err.contains("Ambiguous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_without_targets_errors() {
+        let mgr = TargetManager::new();
+        assert!(mgr.resolve(None).is_err());
+    }
+
+    #[test]
+    fn seed_next_id_controls_next_allocation() {
+        let mut mgr = TargetManager::new();
+        mgr.seed_next_id("t7");
+        assert_eq!(mgr.insert_dummy("a", "/a"), "t7");
+        assert_eq!(mgr.insert_dummy("b", "/b"), "t8");
+
+        let mut mgr2 = TargetManager::new();
+        mgr2.seed_next_id("bogus");
+        assert_eq!(mgr2.insert_dummy("a", "/a"), "t1");
+    }
+
+    #[test]
+    fn is_idb_path_by_extension() {
+        assert!(is_idb_path(Path::new("/x/app.i64")));
+        assert!(is_idb_path(Path::new("/x/app.IDB")));
+        assert!(is_idb_path(Path::new("/x/app.id0")));
+        assert!(!is_idb_path(Path::new("/x/app.so")));
+        assert!(!is_idb_path(Path::new("/x/noext")));
+    }
+
+    #[test]
+    fn effective_idb_out_defaults_and_explicit() {
+        // Existing-IDB input: no output path.
+        assert_eq!(effective_idb_out(Path::new("/x/app.i64"), None), None);
+        assert_eq!(
+            effective_idb_out(Path::new("/x/app.i64"), Some("/tmp/ignored.i64")),
+            None
+        );
+        // Raw binary: default <file>.i64.
+        assert_eq!(
+            effective_idb_out(Path::new("/x/app.so"), None),
+            Some(PathBuf::from("/x/app.so.i64"))
+        );
+        // Raw binary with explicit output.
+        assert_eq!(
+            effective_idb_out(Path::new("/x/app.so"), Some("/out/app.i64")),
+            Some(PathBuf::from("/out/app.i64"))
+        );
+    }
+
+    #[test]
+    fn expand_path_handles_tilde() {
+        let home = std::env::var_os("HOME").expect("HOME set");
+        assert_eq!(
+            expand_path("~/x/y.so"),
+            PathBuf::from(home).join("x/y.so")
+        );
+        assert_eq!(expand_path("/abs/p"), PathBuf::from("/abs/p"));
+        assert_eq!(expand_path("rel/p"), PathBuf::from("rel/p"));
     }
 }

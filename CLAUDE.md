@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The CLI uses a persistent daemon architecture:
 
-1. **Daemon** (`src/daemon/`) — long-running process started via `ida-rs-cli daemon start`. Binds a Unix socket, manages a `TargetManager` that holds loaded IDA databases in memory.
+1. **Daemon** (`src/daemon/`) — router process started via `ida-rs-cli daemon start`. Binds the public Unix socket and spawns one worker subprocess per target (`ida-rs-cli daemon worker`, hidden). Each worker holds exactly one IDA database in memory via its `TargetManager`, because idalib permits only one open IDB per process.
 2. **CLI** (`src/cli.rs`) — stateless client. Parses commands via `clap`, serializes to JSON-line requests, sends over Unix socket, prints JSON response to stdout.
 3. **Handlers** (`src/ida/handlers/`) — actual IDA analysis logic. Each handler function processes a request and returns results.
 
@@ -60,7 +60,8 @@ src/
 │   └── mcp_main.rs     # MCP server entry point
 ├── daemon/
 │   ├── mod.rs           # Daemon startup + socket binding
-│   ├── server.rs        # Request dispatch to handlers
+│   ├── router.rs        # Public socket, target table, worker spawn/forward
+│   ├── worker.rs        # Per-target subprocess: request dispatch to handlers
 │   ├── protocol.rs      # JSON-line request/response types
 │   └── target.rs        # TargetManager (multi-binary support)
 ├── ida/

@@ -1,59 +1,83 @@
-//! Daemon server: Unix socket listener + IDA main-thread dispatch.
+//! Worker process: per-target Unix socket server + IDA main-thread dispatch.
 //!
-//! Architecture:
-//! - Main thread: IDA init -> loops receiving (Request, oneshot::Sender<Response>)
-//!   from a channel, dispatches on TargetManager, sends Response back.
-//! - Tokio thread: Accepts Unix socket connections, reads JSON-line requests,
-//!   sends them to main thread via channel, awaits response, writes back.
+//! Each worker holds exactly one IDB (idalib allows only one open database
+//! per process). The router spawns one worker per `target load` and forwards
+//! analysis requests to it. All IDA operations run on the worker's main
+//! thread; a tokio runtime on a side thread serves the socket protocol.
+//!
+//! Shutdown paths:
+//! - "shutdown" op: the connection handler flushes the response, then posts
+//!   `WorkItem::Exit` so the main loop breaks only after the reply is out.
+//! - stdin EOF: the router holds this worker's stdin pipe open; if the router
+//!   dies, the watchdog thread notices EOF and posts `WorkItem::Exit`.
 
 use crate::daemon::protocol::{Request, Response};
 use crate::daemon::target::TargetManager;
-use crate::daemon::{registry_path, socket_path};
+use crate::daemon::{read_line_capped, MAX_LINE_BYTES};
 use crate::ida::handlers;
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::Write;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
 /// Message sent from the socket server to the IDA main thread.
-struct WorkItem {
-    request: Request,
-    reply_tx: oneshot::Sender<Response>,
+enum WorkItem {
+    Request {
+        request: Request,
+        reply_tx: oneshot::Sender<Response>,
+    },
+    /// Break the main dispatch loop (sent only after in-flight replies were
+    /// flushed, or by the stdin-EOF watchdog when the router died).
+    Exit,
 }
 
-/// Run the daemon (foreground mode). This function blocks forever.
-pub fn run_daemon(foreground: bool) -> anyhow::Result<()> {
-    let sock_path = socket_path();
+/// Run a worker (foreground, blocks until shutdown). `sock_path` is this
+/// worker's private socket; `id` seeds the TargetManager so the single target
+/// carries the router-assigned ID (e.g. "t3").
+pub fn run_worker(sock_path: PathBuf, id: &str) -> anyhow::Result<()> {
     if let Some(parent) = sock_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    // Remove stale socket
     if sock_path.exists() {
         fs::remove_file(&sock_path)?;
     }
 
     // Initialize IDA library on main thread
-    info!("Initializing IDA library...");
+    info!(target_id = id, "Worker initializing IDA library...");
     idalib::init_library()
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     // Suppress IDA's "Thank you for using IDA" goodbye message on exit
     let _ = idalib::enable_console_messages(false);
-    info!("IDA library initialized");
+    info!(target_id = id, "Worker IDA library initialized");
 
     // Channel: socket thread -> main thread
     let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(64);
 
-    // Write registry
-    write_registry(&sock_path)?;
+    // Watchdog: exit when the router dies (stdin pipe EOF).
+    {
+        let exit_tx = work_tx.clone();
+        thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 64];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        info!("Router stdin pipe closed, worker exiting");
+                        let _ = exit_tx.send(WorkItem::Exit);
+                        break;
+                    }
+                    Ok(_) => {} // router never writes; discard
+                }
+            }
+        });
+    }
 
     // Spawn tokio thread for socket server
     let sock_path_clone = sock_path.clone();
@@ -69,29 +93,24 @@ pub fn run_daemon(foreground: bool) -> anyhow::Result<()> {
         });
     });
 
-    info!("Daemon ready. Socket: {}", sock_path.display());
-    if !foreground {
-        info!("Running in foreground mode (use Ctrl+C to stop)");
-    }
+    info!(target_id = id, "Worker ready. Socket: {}", sock_path.display());
 
-    // Main thread: IDA dispatch loop
+    // Main thread: IDA dispatch loop (single-target manager)
     let mut target_mgr = TargetManager::new();
+    target_mgr.seed_next_id(id);
 
     loop {
         match work_rx.recv() {
-            Ok(item) => {
-                let is_shutdown = item.request.op == "shutdown";
-                let response = dispatch_request(&mut target_mgr, item.request);
-                let _ = item.reply_tx.send(response);
-                if is_shutdown {
-                    info!("Shutdown complete, exiting main loop");
-                    // Give the socket handler a moment to flush the response
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    break;
-                }
+            Ok(WorkItem::Request { request, reply_tx }) => {
+                let response = dispatch_request(&mut target_mgr, request);
+                let _ = reply_tx.send(response);
+            }
+            Ok(WorkItem::Exit) => {
+                info!("Worker shutting down");
+                break;
             }
             Err(_) => {
-                info!("Work channel closed, daemon shutting down");
+                info!("Work channel closed, worker shutting down");
                 break;
             }
         }
@@ -99,28 +118,7 @@ pub fn run_daemon(foreground: bool) -> anyhow::Result<()> {
 
     // Cleanup
     let _ = fs::remove_file(&sock_path);
-    let _ = fs::remove_file(registry_path());
-    info!("Daemon stopped");
-    Ok(())
-}
-
-fn write_registry(sock_path: &PathBuf) -> anyhow::Result<()> {
-    let reg_path = registry_path();
-    if let Some(parent) = reg_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let registry = json!({
-        "pid": std::process::id(),
-        "socket": sock_path.display().to_string(),
-        "started_at": secs,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-    let mut file = fs::File::create(&reg_path)?;
-    file.write_all(serde_json::to_string_pretty(&registry)?.as_bytes())?;
+    info!("Worker stopped");
     Ok(())
 }
 
@@ -133,7 +131,7 @@ async fn run_socket_server(sock_path: &PathBuf, work_tx: mpsc::SyncSender<WorkIt
         }
     };
 
-    info!("Socket server listening on {}", sock_path.display());
+    info!("Worker socket server listening on {}", sock_path.display());
 
     loop {
         match listener.accept().await {
@@ -156,10 +154,22 @@ async fn handle_connection(
     work_tx: mpsc::SyncSender<WorkItem>,
 ) {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut line_buf: Vec<u8> = Vec::new();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_string();
+    loop {
+        line_buf.clear();
+        match read_line_capped(&mut reader, &mut line_buf, MAX_LINE_BYTES).await {
+            Ok(0) => break, // clean EOF
+            Ok(_) => {}
+            Err(e) => {
+                let err = Response::error("?".to_string(), format!("Read error: {}", e));
+                let _ = write_response(&mut writer, &err).await;
+                break;
+            }
+        }
+
+        let line = String::from_utf8_lossy(&line_buf).trim().to_string();
         if line.is_empty() {
             continue;
         }
@@ -174,17 +184,29 @@ async fn handle_connection(
         };
 
         let req_id = request.id.clone();
+        let is_shutdown = request.op == "shutdown";
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        if work_tx.send(WorkItem { request, reply_tx }).is_err() {
-            let err = Response::error(req_id, "Daemon shutting down");
+        // Never block a tokio worker thread on a full queue: report busy
+        // instead so slow analysis on this target does not stall the socket.
+        if let Err(mpsc::TrySendError::Full(_) | mpsc::TrySendError::Disconnected(_)) =
+            work_tx.try_send(WorkItem::Request { request, reply_tx })
+        {
+            let err = Response::error(req_id, "Worker busy or shutting down");
             let _ = write_response(&mut writer, &err).await;
-            break;
+            continue;
         }
 
         match reply_rx.await {
             Ok(response) => {
-                let _ = write_response(&mut writer, &response).await;
+                if write_response(&mut writer, &response).await.is_err() {
+                    break;
+                }
+                // Reply is flushed; only now may the main loop exit.
+                if is_shutdown {
+                    let _ = work_tx.send(WorkItem::Exit);
+                    break;
+                }
             }
             Err(_) => {
                 let err = Response::error(req_id, "Internal: reply dropped");
@@ -198,7 +220,17 @@ async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
 ) -> std::io::Result<()> {
-    let line = serde_json::to_string(response).unwrap_or_default();
+    let line = match serde_json::to_string(response) {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to serialize response {}: {}", response.id, e);
+            serde_json::to_string(&Response::error(
+                response.id.clone(),
+                format!("Internal: response serialization failed: {}", e),
+            ))
+            .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization\"}".to_string())
+        }
+    };
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
@@ -223,6 +255,12 @@ fn dispatch_inner(mgr: &mut TargetManager, req: &Request) -> Result<Value, Strin
     match req.op.as_str() {
         // -- Target management --
         "target.load" => {
+            // idalib permits only one open IDB per process (the IDB holds the
+            // process-global library mutex for its lifetime), so a worker is
+            // strictly single-target; the router spawns one worker per load.
+            if !mgr.list().is_empty() {
+                return Err("Worker already has a target loaded".to_string());
+            }
             let path = param_str(p, "path")?;
             let auto_analyse = param_bool(p, "auto_analyse", true);
             let idb_out = p.get("idb_out").and_then(|v| v.as_str());
@@ -809,7 +847,7 @@ fn param_addr_vec(p: &Value, key: &str) -> Result<Vec<u64>, String> {
     strs.iter().map(|s| parse_addr(s)).collect()
 }
 
-fn parse_addr(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_addr(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.starts_with("0x") || s.starts_with("0X") {
         u64::from_str_radix(&s[2..], 16).map_err(|_| format!("Invalid address: {}", s))
@@ -820,7 +858,7 @@ fn parse_addr(s: &str) -> Result<u64, String> {
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         return Err("Hex bytes string has odd length".to_string());
     }
     (0..cleaned.len())
@@ -855,4 +893,57 @@ fn apply_max_lines(s: &str, max_lines: usize) -> String {
         ));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_addr_hex_and_decimal() {
+        assert_eq!(parse_addr("0x1000").unwrap(), 0x1000);
+        assert_eq!(parse_addr("0Xff").unwrap(), 255);
+        assert_eq!(parse_addr("4096").unwrap(), 4096);
+        assert!(parse_addr("0xzz").is_err());
+        assert!(parse_addr("abc").is_err());
+    }
+
+    #[test]
+    fn parse_hex_bytes_accepts_spaced_and_compact() {
+        assert_eq!(parse_hex_bytes("90 90 90").unwrap(), vec![0x90; 3]);
+        assert_eq!(parse_hex_bytes("909090").unwrap(), vec![0x90; 3]);
+        assert!(parse_hex_bytes("909").is_err()); // odd length
+        assert!(parse_hex_bytes("zz").is_err());
+    }
+
+    #[test]
+    fn apply_line_offset_skips_lines() {
+        assert_eq!(apply_line_offset("a\nb\nc", 0), "a\nb\nc");
+        assert_eq!(apply_line_offset("a\nb\nc", 2), "c");
+        assert_eq!(apply_line_offset("a\nb\nc", 5), "");
+    }
+
+    #[test]
+    fn apply_max_lines_truncates_with_note() {
+        assert_eq!(apply_max_lines("a\nb\nc", 0), "a\nb\nc");
+        let out = apply_max_lines("a\nb\nc", 2);
+        assert!(out.starts_with("a\nb"));
+        assert!(out.contains("1 lines truncated"));
+    }
+
+    #[test]
+    fn worker_rejects_second_load() {
+        // dispatch_inner is the real worker entry point; with a dummy target
+        // present, a second target.load must be refused before touching IDA.
+        let mut mgr = TargetManager::new();
+        mgr.insert_dummy("a.bin", "/tmp/a.bin");
+        let req = Request {
+            id: "x".into(),
+            op: "target.load".into(),
+            params: json!({"path": "/tmp/b.bin", "auto_analyse": true}),
+            target: None,
+        };
+        let err = dispatch_inner(&mut mgr, &req).unwrap_err();
+        assert!(err.contains("already has a target"), "unexpected: {err}");
+    }
 }
